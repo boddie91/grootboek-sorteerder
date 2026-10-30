@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grootboek Sorteerder (Outlook)</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Inter', sans-serif; background: #FAFAF7; color: #1B2430; margin: 0; }
+  .font-display { font-family: 'Zilla Slab', serif; }
+  .font-mono-num { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
+  .ledger-row { border-bottom: 1px solid #E4E1D6; }
+  .ledger-total { border-top: 1px solid #1B2430; border-bottom: 3px double #1B2430; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script type="module">
+import { html, render, useState, useEffect } from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
+
+/* ---------- helpers ---------- */
+
+const STORAGE_KEY = "grootboek-sorteerder-leveranciers";
+const uid = () => Math.random().toString(36).slice(2, 10);
+const fmtEUR = (n) => n.toLocaleString("nl-NL", { style: "currency", currency: "EUR" });
+
+function loadSuppliers() {
+  try {
+    const v = localStorage.getItem(STORAGE_KEY);
+    return v ? JSON.parse(v) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+// Last euro-style amount on a line: 1.234,56 / 123,45 / 123.45, minus sign before OR after
+function extractAmount(line) {
+  const matches = [...line.matchAll(/-?\d{1,3}(?:[.\s]\d{3})*,\d{2}-?|-?\d+\.\d{2}-?/g)];
+  if (matches.length === 0) return null;
+  const last = matches[matches.length - 1];
+  const rawMatch = last[0];
+  const omschrijving = line.slice(0, last.index).trim();
+  let raw = rawMatch;
+  let negative = false;
+  if (raw.startsWith("-")) { negative = true; raw = raw.slice(1); }
+  if (raw.endsWith("-")) { negative = true; raw = raw.slice(0, -1); }
+  let normalized = raw;
+  if (raw.includes(",")) normalized = raw.replace(/[.\s]/g, "").replace(",", ".");
+  let bedrag = parseFloat(normalized);
+  if (Number.isNaN(bedrag)) return null;
+  if (negative) bedrag = -Math.abs(bedrag);
+  return { omschrijving: omschrijving || rawMatch, bedrag };
+}
+
+function parseInvoiceText(text) {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((raw, i) => {
+      const parsed = extractAmount(raw);
+      return {
+        id: `${i}-${uid()}`,
+        raw,
+        omschrijving: parsed ? parsed.omschrijving : raw,
+        bedrag: parsed ? parsed.bedrag : null,
+      };
+    });
+}
+
+function matchRule(omschrijving, rules) {
+  const lower = omschrijving.toLowerCase();
+  let best = null;
+  for (const r of rules) {
+    if (!r.keyword) continue;
+    if (lower.includes(r.keyword.toLowerCase())) {
+      if (!best || r.keyword.length > best.keyword.length) best = r;
+    }
+  }
+  return best;
+}
+
+// Stable keyword guess: leading article code + description, stop at bare numbers / unit words
+const UNIT_WORDS = /^(stuks?|st\.?|kg|gr|g|ltr|liter|l|doos|dozen|x|krat|kratten|pak|pk|pallet|colli|cs|ds)$/i;
+function guessStableKeyword(omschrijving) {
+  const tokens = (omschrijving || "").trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "";
+  const kept = [tokens[0]];
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^\d+([.,]\d+)?%?$/.test(t)) break;
+    if (UNIT_WORDS.test(t)) break;
+    kept.push(t);
+  }
+  return kept.join(" ").slice(0, 40);
+}
+
+// Best-effort: always shown as editable
+function extractInvoiceMeta(text) {
+  const numMatch = text.match(/factuur\s*(?:nummer|nr)?[.:\s]*([A-Z0-9][A-Z0-9\-\/]{2,})/i);
+  const dateMatch = text.match(/(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/);
+  const totalMatch = text.match(
+    /(?:totaal|subtotaal)\s*(?:excl(?:usief)?\.?\s*(?:btw)?)?[\s:]*€?\s*(-?\d{1,3}(?:[.\s]\d{3})*,\d{2})/i
+  );
+  return {
+    factuurnummer: numMatch ? numMatch[1] : "",
+    factuurdatum: dateMatch ? dateMatch[1] : "",
+    totaalNetto: totalMatch ? totalMatch[1] : "",
+  };
+}
+
+function downloadFile(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+/* ---------- icons ---------- */
+
+const Icon = ({ d, cls }) => html`
+  <svg class=${cls || "w-4 h-4"} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d=${d} /></svg>`;
+const ICONS = {
+  trash: "M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14M10 11v6M14 11v6",
+  plus: "M12 5v14M5 12h14",
+  check: "M20 6 9 17l-5-5",
+  chevron: "m6 9 6 6 6-6",
+  alert: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01",
+};
+
+const inputCls = "px-2 py-1 text-xs rounded border border-[#DCD8CB] focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]";
+
+/* ---------- assign form (used for unmatched + ignored lines) ---------- */
+
+const AssignForm = ({ u, draft, setDraft, onAssign, supplierName, needsAmount }) => {
+  const d = draft || {};
+  const keywordValue = d.keyword !== undefined ? d.keyword : guessStableKeyword(u.omschrijving || u.raw || "");
+  return html`
+    <div class="flex items-center gap-1.5 mt-1.5 flex-wrap">
+      ${!needsAmount && html`
+        <input class=${inputCls + " w-full"} placeholder="Trefwoord om te onthouden"
+          value=${keywordValue} onInput=${(e) => setDraft(u.id, { keyword: e.target.value })} />`}
+      ${needsAmount && html`
+        <input class=${inputCls + " w-28 font-mono-num"} placeholder="Bedrag (bv. 12,50)"
+          value=${d.bedrag || ""} onInput=${(e) => setDraft(u.id, { bedrag: e.target.value })} />`}
+      <input class=${inputCls + " w-24 font-mono-num"} placeholder="Grootboek nr."
+        value=${d.grootboek || ""} onInput=${(e) => setDraft(u.id, { grootboek: e.target.value })} />
+      <input class=${inputCls + " w-32"} placeholder="Naam (optioneel)"
+        value=${d.grootboekNaam || ""} onInput=${(e) => setDraft(u.id, { grootboekNaam: e.target.value })} />
+      <input class=${inputCls + " w-14 font-mono-num"} placeholder="BTW"
+        value=${d.btwCode || ""} onInput=${(e) => setDraft(u.id, { btwCode: e.target.value })} />
+      ${!needsAmount && html`
+        <label class="flex items-center gap-1 text-xs text-[#5c5848]">
+          <input type="checkbox" checked=${!!d.remember} onChange=${(e) => setDraft(u.id, { remember: e.target.checked })} />
+          onthoud voor ${supplierName}
+        </label>`}
+      <button onClick=${() => onAssign(u.id)}
+        class="ml-auto px-2 py-1 text-xs rounded bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] flex items-center gap-1">
+        <${Icon} d=${ICONS.check} cls="w-3 h-3" /> Toewijzen
+      </button>
+    </div>`;
+};
+
+/* ---------- app ---------- */
+
+function App() {
+  const [suppliers, setSuppliers] = useState(loadSuppliers);
+  const [selectedId, setSelectedId] = useState(() => loadSuppliers()[0]?.id || null);
+  const [invoiceText, setInvoiceText] = useState("");
+  const [lines, setLines] = useState([]);
+  const [newSupplierName, setNewSupplierName] = useState("");
+  const [newRule, setNewRule] = useState({ keyword: "", grootboek: "", grootboekNaam: "", btwCode: "" });
+  const [assignDraft, setAssignDraft] = useState({});
+  const [saveState, setSaveState] = useState("idle");
+  const [pdfLibReady, setPdfLibReady] = useState(!!window.pdfjsLib);
+  const [pdfStatus, setPdfStatus] = useState("idle");
+  const [pdfError, setPdfError] = useState("");
+  const [rulesExpanded, setRulesExpanded] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [ignoredExpanded, setIgnoredExpanded] = useState(false);
+  const [invoiceMeta, setInvoiceMeta] = useState({ factuurnummer: "", factuurdatum: "", totaalNetto: "" });
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [excludedFromMatch, setExcludedFromMatch] = useState([]);
+  const [dragging, setDragging] = useState(false);
+  const [tab, setTab] = useState("sorteren");
+  const [mailAtts, setMailAtts] = useState([]);
+  const [mailInfo, setMailInfo] = useState("");
+  const [attLoading, setAttLoading] = useState("");
+
+  /* pdf.js */
+  useEffect(() => {
+    if (window.pdfjsLib) { setPdfLibReady(true); return; }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      setPdfLibReady(true);
+    };
+    script.onerror = () => setPdfError("Kon de PDF-lezer niet laden. Is er internetverbinding?");
+    document.body.appendChild(script);
+  }, []);
+
+  const persist = (next) => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setSaveState("saved");
+      setTimeout(() => setSaveState("idle"), 1200);
+    } catch (e) {
+      setSaveState("error");
+    }
+  };
+
+  const updateSuppliers = (next) => {
+    setSuppliers(next);
+    persist(next);
+  };
+
+  const supplier = suppliers.find((s) => s.id === selectedId) || null;
+  const rules = supplier?.rules || [];
+
+  /* ----- PDF ----- */
+  const extractPdfLines = async (file) => {
+    const buffer = await file.arrayBuffer();
+    const pdf = await window.pdfjsLib.getDocument({ data: buffer }).promise;
+    const allLines = [];
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const items = content.items
+        .map((it) => ({ str: it.str, x: it.transform[4], y: it.transform[5] }))
+        .filter((it) => it.str.trim().length > 0);
+      items.sort((a, b) => b.y - a.y || a.x - b.x);
+      let currentY = null;
+      let currentLine = [];
+      const tolerance = 2.5;
+      for (const it of items) {
+        if (currentY === null || Math.abs(it.y - currentY) > tolerance) {
+          if (currentLine.length) allLines.push(currentLine.map((i) => i.str).join(" "));
+          currentLine = [it];
+          currentY = it.y;
+        } else {
+          currentLine.push(it);
+        }
+      }
+      if (currentLine.length) allLines.push(currentLine.map((i) => i.str).join(" "));
+    }
+    return allLines.join("\n");
+  };
+
+  const handlePdfFile = async (file) => {
+    if (!file) return;
+    if (!(file.type === "application/pdf" || /\.pdf$/i.test(file.name))) {
+      setPdfStatus("error");
+      setPdfError("Dit is geen PDF-bestand.");
+      return;
+    }
+    setPdfError("");
+    if (!window.pdfjsLib) {
+      setPdfStatus("loading-lib");
+      const start = Date.now();
+      while (!window.pdfjsLib && Date.now() - start < 8000) {
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      if (!window.pdfjsLib) {
+        setPdfStatus("error");
+        setPdfError("De PDF-lezer is nog niet geladen, probeer het nog eens.");
+        return;
+      }
+    }
+    setPdfStatus("reading");
+    try {
+      const text = await extractPdfLines(file);
+      setInvoiceText(text);
+      setPdfStatus("idle");
+    } catch (err) {
+      setPdfStatus("error");
+      setPdfError("Kon deze PDF niet uitlezen — mogelijk een scan zonder tekstlaag. Kopieer de regels dan handmatig.");
+    }
+  };
+
+  const onPdfInput = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    handlePdfFile(file);
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault();
+    setDragging(false);
+    handlePdfFile(e.dataTransfer?.files?.[0]);
+  };
+
+
+  /* ---------- Outlook: bijlagen van geopende mail ---------- */
+  useEffect(() => {
+    if (!window.Office || !Office.onReady) return;
+    Office.onReady((info) => {
+      try {
+        const item = Office.context && Office.context.mailbox && Office.context.mailbox.item;
+        if (!item) return;
+        const atts = (item.attachments || []).filter(
+          (a) => a.attachmentType === "file" && (/pdf/i.test(a.contentType || "") || /\.pdf$/i.test(a.name || ""))
+        );
+        setMailAtts(atts);
+        const from = ((item.from && (item.from.displayName + " " + item.from.emailAddress)) || "") + " " + (item.subject || "");
+        setMailInfo(from.trim());
+        const match = suppliers.find((s) => s.name && from.toLowerCase().includes(s.name.toLowerCase()));
+        if (match) setSelectedId(match.id);
+      } catch (e) {}
+    });
+  }, []);
+
+  const loadAttachment = (att) => {
+    setAttLoading(att.id);
+    setPdfError("");
+    Office.context.mailbox.item.getAttachmentContentAsync(att.id, async (res) => {
+      setAttLoading("");
+      if (res.status !== Office.AsyncResultStatus.Succeeded || !res.value || res.value.format !== Office.MailboxEnums.AttachmentContentFormat.Base64) {
+        setPdfStatus("error");
+        setPdfError("Kon de bijlage niet ophalen uit Outlook.");
+        return;
+      }
+      const bin = atob(res.value.content);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      await handlePdfFile(new File([bytes], att.name || "factuur.pdf", { type: "application/pdf" }));
+    });
+  };
+
+  /* ----- suppliers & rules ----- */
+  const addSupplier = () => {
+    const name = newSupplierName.trim();
+    if (!name) return;
+    const s = { id: uid(), name, rules: [] };
+    updateSuppliers([...suppliers, s]);
+    setSelectedId(s.id);
+    setNewSupplierName("");
+  };
+
+  const deleteSupplier = (id) => {
+    const next = suppliers.filter((s) => s.id !== id);
+    updateSuppliers(next);
+    if (selectedId === id) setSelectedId(next[0]?.id || null);
+  };
+
+  const addRule = () => {
+    if (!supplier) return;
+    const { keyword, grootboek, grootboekNaam, btwCode } = newRule;
+    if (!keyword.trim() || !grootboek.trim()) return;
+    const rule = {
+      id: uid(),
+      keyword: keyword.trim(),
+      grootboek: grootboek.trim(),
+      grootboekNaam: grootboekNaam.trim(),
+      btwCode: btwCode.trim(),
+    };
+    updateSuppliers(suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: [...s.rules, rule] } : s)));
+    setNewRule({ keyword: "", grootboek: "", grootboekNaam: "", btwCode: "" });
+  };
+
+  const updateRule = (ruleId, patch) => {
+    updateSuppliers(
+      suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: s.rules.map((r) => (r.id === ruleId ? { ...r, ...patch } : r)) } : s))
+    );
+  };
+
+  const deleteRule = (ruleId) => {
+    updateSuppliers(
+      suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: s.rules.filter((r) => r.id !== ruleId) } : s))
+    );
+  };
+
+  /* ----- invoice flow ----- */
+  const handleParse = () => {
+    setLines(parseInvoiceText(invoiceText));
+    setAssignDraft({});
+    setInvoiceMeta(extractInvoiceMeta(invoiceText));
+    setExcludedFromMatch([]);
+  };
+
+  const doReset = () => {
+    setInvoiceText("");
+    setLines([]);
+    setAssignDraft({});
+    setPdfError("");
+    setPdfStatus("idle");
+    setInvoiceMeta({ factuurnummer: "", factuurdatum: "", totaalNetto: "" });
+    setConfirmingReset(false);
+    setExcludedFromMatch([]);
+  };
+
+  const requestReset = () => {
+    if (invoiceText.trim() || lines.length > 0) setConfirmingReset(true);
+    else doReset();
+  };
+
+  const setDraft = (id, patch) =>
+    setAssignDraft((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+
+  const confirmAssign = (lineId) => {
+    const draft = assignDraft[lineId];
+    if (!draft || !draft.grootboek?.trim()) return;
+    const line = lines.find((l) => l.id === lineId);
+    let bedragOverride;
+    if (line && line.bedrag === null) {
+      if (!draft.bedrag?.trim()) return;
+      const parsedBedrag = parseFloat(draft.bedrag.replace(/\./g, "").replace(",", "."));
+      if (Number.isNaN(parsedBedrag)) return;
+      bedragOverride = parsedBedrag;
+    }
+    if (draft.remember && supplier) {
+      const keyword = draft.keyword?.trim() || guessStableKeyword(line?.omschrijving || "");
+      if (keyword) {
+        const rule = {
+          id: uid(),
+          keyword,
+          grootboek: draft.grootboek.trim(),
+          grootboekNaam: draft.grootboekNaam?.trim() || "",
+          btwCode: draft.btwCode?.trim() || "",
+        };
+        updateSuppliers(suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: [...s.rules, rule] } : s)));
+      }
+    }
+    setLines((prev) =>
+      prev.map((l) =>
+        l.id === lineId
+          ? {
+              ...l,
+              _forcedGrootboek: draft.grootboek.trim(),
+              _forcedNaam: draft.grootboekNaam?.trim() || "",
+              _forcedBtw: draft.btwCode?.trim() || "",
+              ...(bedragOverride !== undefined ? { _forcedBedrag: bedragOverride } : {}),
+            }
+          : l
+      )
+    );
+  };
+
+  const unlinkLine = (lineId) => {
+    setLines((prev) =>
+      prev.map((l) =>
+        l.id === lineId
+          ? { ...l, _forcedGrootboek: undefined, _forcedNaam: undefined, _forcedBtw: undefined, _forcedBedrag: undefined }
+          : l
+      )
+    );
+    setExcludedFromMatch((prev) => (prev.includes(lineId) ? prev : [...prev, lineId]));
+  };
+
+  /* ----- sort lines into groups / unmatched / ignored ----- */
+  const groups = {};
+  const unmatched = [];
+  const ignoredLines = [];
+  const addToGroup = (key, naam, btw, item) => {
+    if (!groups[key]) groups[key] = { grootboek: key, grootboekNaam: naam, btwCode: btw, items: [], total: 0 };
+    groups[key].items.push(item);
+    groups[key].total += item.bedrag;
+  };
+  for (const line of lines) {
+    if (line._forcedGrootboek) {
+      const amount = line._forcedBedrag !== undefined ? line._forcedBedrag : line.bedrag;
+      addToGroup(line._forcedGrootboek, line._forcedNaam, line._forcedBtw, { ...line, bedrag: amount });
+      continue;
+    }
+    if (line.bedrag === null) { ignoredLines.push(line); continue; }
+    if (excludedFromMatch.includes(line.id)) { unmatched.push(line); continue; }
+    const rule = matchRule(line.omschrijving, rules);
+    if (rule) addToGroup(rule.grootboek, rule.grootboekNaam, rule.btwCode || "", line);
+    else unmatched.push(line);
+  }
+  const finalGroups = Object.values(groups).sort((a, b) => a.grootboek.localeCompare(b.grootboek));
+  const finalTotal = finalGroups.reduce((s, g) => s + g.total, 0);
+
+  /* ----- export / import ----- */
+  const exportSettings = () =>
+    downloadFile("grootboek-instellingen.json", JSON.stringify(suppliers, null, 2), "application/json");
+
+  const importSettings = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setImportError("");
+    try {
+      const parsed = JSON.parse(await file.text());
+      if (!Array.isArray(parsed)) throw new Error("ongeldig formaat");
+      updateSuppliers(parsed);
+      setSelectedId(parsed[0]?.id || null);
+    } catch (err) {
+      setImportError("Kon dit bestand niet inladen — is het een eerder opgeslagen instellingenbestand?");
+    }
+  };
+
+  const exportCSV = () => {
+    const rows = [["Grootboeknummer", "Omschrijving", "Bedrag", "BTW-code", "Factuurnummer", "Factuurdatum"]];
+    for (const g of finalGroups) {
+      rows.push([
+        g.grootboek,
+        g.grootboekNaam || "",
+        g.total.toFixed(2).replace(".", ","),
+        g.btwCode || "",
+        invoiceMeta.factuurnummer || "",
+        invoiceMeta.factuurdatum || "",
+      ]);
+    }
+    const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(";")).join("\n");
+    downloadFile(`grootboek-export-${supplier?.name || "export"}.csv`, csv, "text/csv;charset=utf-8;");
+  };
+
+  /* ---------- render ---------- */
+  const TABS = [
+    ["sorteren", "Facturen sorteren"],
+    ["leveranciers", "Leveranciers"],
+    ["regels", "Boekingsregels"],
+    ["instellingen", "Instellingen"],
+  ];
+  const ruleCount = suppliers.reduce((n, s) => n + s.rules.length, 0);
+
+  /* ----- tab 1: facturen sorteren ----- */
+  const sorteerTab = html`
+    <div>
+      <div class="mb-5">
+        <label class="block text-xs text-[#5c5848] mb-1" for="lev-select">Leverancier</label>
+        ${suppliers.length === 0
+          ? html`<p class="text-sm text-[#8a8676]">
+              Er zijn nog geen leveranciers.
+              <button class="underline text-[#1F3A5F]" onClick=${() => setTab("leveranciers")}>Voeg er eerst een toe</button>.
+            </p>`
+          : html`<select id="lev-select" value=${selectedId || ""}
+              onChange=${(e) => setSelectedId(e.target.value)}
+              class="w-full sm:w-72 px-2.5 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]">
+              ${suppliers.map((s) => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+            </select>`}
+      </div>
+
+      ${mailAtts.length > 0 && html`
+        <div class="mb-4 p-3 rounded-md border border-[#C9D2DE] bg-[#EEF2F7]">
+          <p class="text-xs text-[#1F3A5F] font-semibold mb-2">PDF-bijlagen in deze mail</p>
+          ${mailAtts.map((a) => html`
+            <button key=${a.id} onClick=${() => loadAttachment(a)} disabled=${attLoading === a.id}
+              class="w-full text-left px-3 py-2 mb-1 text-sm rounded-md bg-white border border-[#DCD8CB] hover:bg-[#F4F2E9] disabled:opacity-50 truncate">
+              ${attLoading === a.id ? "Ophalen…" : a.name}
+            </button>`)}
+        </div>`}
+
+      <label
+        onDragOver=${(e) => { e.preventDefault(); setDragging(true); }}
+        onDragLeave=${() => setDragging(false)}
+        onDrop=${onDrop}
+        class=${`block mb-3 px-4 py-6 text-center text-sm rounded-md border-2 border-dashed cursor-pointer transition-colors ${
+          dragging ? "border-[#1F3A5F] bg-[#E8EDF4] text-[#1F3A5F]" : "border-[#C9C5B6] bg-white text-[#5c5848] hover:bg-[#F4F2E9]"
+        }`}>
+        Sleep hier een PDF-factuur naartoe, of <span class="underline text-[#1F3A5F]">klik om te kiezen</span>
+        <input type="file" accept="application/pdf" class="hidden" onChange=${onPdfInput} />
+      </label>
+      ${pdfStatus === "loading-lib" && html`<p class="text-xs text-[#5c5848] mb-2">PDF-lezer laden…</p>`}
+      ${pdfStatus === "reading" && html`<p class="text-xs text-[#5c5848] mb-2">Tekst uitlezen…</p>`}
+      ${pdfError && html`<p class="text-xs text-[#B34D4D] mb-2">${pdfError}</p>`}
+
+      <p class="text-xs text-[#5c5848] mb-2">Of plak de regels zelf hieronder (één regel per product, bedrag aan het eind).</p>
+      <textarea rows="6" value=${invoiceText} onInput=${(e) => setInvoiceText(e.target.value)}
+        placeholder=${"Verpakkingsmateriaal doos M    24,50\nTransportkosten NL             12,00\nEtiketten rol 500 stuks        8,95"}
+        class="w-full px-3 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white font-mono-num focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]"></textarea>
+
+      <div class="flex items-center gap-2">
+        <button onClick=${handleParse} disabled=${!supplier}
+          class="mt-2 px-4 py-2 text-sm rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] disabled:opacity-40 disabled:cursor-not-allowed">
+          Sorteer naar grootboek
+        </button>
+        <button onClick=${requestReset}
+          class="mt-2 px-4 py-2 text-sm rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF]">
+          Nieuwe factuur
+        </button>
+      </div>
+      ${confirmingReset && html`
+        <div class="mt-2 p-3 rounded-md border border-[#E9C9C9] bg-[#FBF2F2] text-sm">
+          <p class="text-[#7a2e2e] mb-2">Weet je zeker dat je een nieuwe factuur wilt beginnen? De huidige regels en resultaten worden verwijderd.</p>
+          <div class="flex gap-2">
+            <button onClick=${doReset} class="px-3 py-1.5 text-xs rounded-md bg-[#B34D4D] text-white hover:bg-[#9c3f3f]">Ja, verwijderen</button>
+            <button onClick=${() => setConfirmingReset(false)} class="px-3 py-1.5 text-xs rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF]">Annuleren</button>
+          </div>
+        </div>`}
+
+      ${lines.length > 0 && html`
+        <div class="mt-6 space-y-6">
+
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white border border-[#E4E1D6] rounded-md p-3">
+            ${[["factuurnummer", "Factuurnummer"], ["factuurdatum", "Factuurdatum"], ["totaalNetto", "Totaal netto"]].map(([key, label]) => html`
+              <label key=${key} class="text-xs text-[#5c5848]">
+                ${label}
+                <input class=${inputCls + " w-full mt-0.5 text-sm font-mono-num"} value=${invoiceMeta[key]}
+                  onInput=${(e) => setInvoiceMeta({ ...invoiceMeta, [key]: e.target.value })} />
+              </label>`)}
+          </div>
+
+          ${finalGroups.map((g) => {
+            const isCollapsed = collapsedGroups[g.grootboek] !== false;
+            return html`
+              <div key=${g.grootboek}>
+                <button onClick=${() => setCollapsedGroups((prev) => ({ ...prev, [g.grootboek]: prev[g.grootboek] === false }))}
+                  class="w-full flex items-center justify-between mb-1">
+                  <div class="flex items-baseline gap-2">
+                    <span class="font-mono-num text-sm font-semibold text-[#1F3A5F]">${g.grootboek}</span>
+                    ${g.grootboekNaam && html`<span class="text-sm text-[#5c5848]">${g.grootboekNaam}</span>`}
+                    <span class="text-xs text-[#8a8676]">(${g.items.length})</span>
+                  </div>
+                  <span class=${`text-[#5c5848] transition-transform ${isCollapsed ? "" : "rotate-180"}`}><${Icon} d=${ICONS.chevron} /></span>
+                </button>
+                <div class="bg-white border border-[#E4E1D6] rounded-md overflow-hidden">
+                  ${!isCollapsed && g.items.map((it) => html`
+                    <div key=${it.id} class="ledger-row flex justify-between items-center px-3 py-1.5 text-sm">
+                      <span>${it.omschrijving}</span>
+                      <div class="flex items-center gap-2">
+                        <span class="font-mono-num">${fmtEUR(it.bedrag)}</span>
+                        <button onClick=${() => unlinkLine(it.id)}
+                          title="Loskoppelen — terugzetten naar 'niet herkend' om opnieuw toe te wijzen"
+                          class="text-[#8a8676] hover:text-[#B34D4D]">
+                          <${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>`)}
+                  <div class="ledger-total flex justify-between px-3 py-1.5 text-sm font-semibold bg-[#F4F2E9]">
+                    <span>Subtotaal ${g.grootboek}</span>
+                    <span class="font-mono-num text-[#3D6B5C]">${fmtEUR(g.total)}</span>
+                  </div>
+                </div>
+              </div>`;
+          })}
+
+          ${finalGroups.length > 0 && html`
+            <div>
+              <div class="flex justify-between px-3 py-2 text-base font-display font-semibold border-t-2 border-[#1B2430]">
+                <span>Totaal</span>
+                <span class="font-mono-num">${fmtEUR(finalTotal)}</span>
+              </div>
+              <button onClick=${exportCSV}
+                class="px-3 py-1.5 text-xs rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#1F3A5F] hover:text-[#F2EFE6]">
+                Exporteer subtotalen als CSV
+              </button>
+            </div>`}
+
+          ${unmatched.length > 0 && html`
+            <div>
+              <div class="flex items-center gap-1.5 text-sm font-semibold text-[#B34D4D] mb-1">
+                <${Icon} d=${ICONS.alert} /> Niet herkend (${unmatched.length})
+              </div>
+              <div class="bg-white border border-[#E9C9C9] rounded-md divide-y divide-[#F1E4E4]">
+                ${unmatched.map((u) => html`
+                  <div key=${u.id} class="px-3 py-2 text-sm">
+                    <div class="flex justify-between items-center">
+                      <span>${u.omschrijving || u.raw}</span>
+                      <span class="font-mono-num text-[#5c5848]">${fmtEUR(u.bedrag)}</span>
+                    </div>
+                    <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
+                      onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${false} />
+                  </div>`)}
+              </div>
+            </div>`}
+
+          ${ignoredLines.length > 0 && html`
+            <div>
+              <button onClick=${() => setIgnoredExpanded((v) => !v)} class="w-full flex items-center justify-between mb-1">
+                <span class="text-sm font-semibold text-[#5c5848]">Standaard genegeerde regels (${ignoredLines.length})</span>
+                <span class=${`text-[#5c5848] transition-transform ${ignoredExpanded ? "rotate-180" : ""}`}><${Icon} d=${ICONS.chevron} /></span>
+              </button>
+              ${ignoredExpanded && html`
+                <p class="text-xs text-[#5c5848] mb-1">Regels zonder bedrag (adres, tekst e.d.) tellen niet mee. Hoort er toch eentje bij? Geef een bedrag en grootboek op.</p>
+                <div class="bg-white border border-[#E4E1D6] rounded-md divide-y divide-[#EFEBDF]">
+                  ${ignoredLines.map((u) => html`
+                    <div key=${u.id} class="px-3 py-2 text-sm">
+                      <div class="text-[#5c5848]">${u.raw}</div>
+                      <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
+                        onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${true} />
+                    </div>`)}
+                </div>`}
+            </div>`}
+        </div>`}
+    </div>`;
+
+  /* ----- tab 2: leveranciers ----- */
+  const leveranciersTab = html`
+    <div class="max-w-md">
+      <div>
+        <h2 class="font-display text-lg mb-3">Leveranciers</h2>
+        ${suppliers.length === 0 && html`<p class="text-sm text-[#8a8676] italic mb-2">Nog geen leveranciers.</p>`}
+        <div class="space-y-1">
+          ${suppliers.map((s) => html`
+            <button key=${s.id} onClick=${() => setSelectedId(s.id)}
+              class=${`w-full text-left px-3 py-2 rounded-md text-sm flex items-center justify-between group border-l-4 ${
+                s.id === selectedId
+                  ? "bg-[#E4E1D6] border-[#1F3A5F] text-[#1B2430] font-semibold"
+                  : "border-transparent hover:bg-[#F4F2E9] text-[#1B2430]"
+              }`}>
+              <span>${s.name}</span>
+              <span role="button" tabindex="0" title="Leverancier verwijderen"
+                onClick=${(e) => { e.stopPropagation(); deleteSupplier(s.id); }}
+                class="opacity-0 group-hover:opacity-100 text-[#8a8676] hover:text-[#B34D4D]">
+                <${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" />
+              </span>
+            </button>`)}
+        </div>
+        <div class="flex gap-2 mt-3">
+          <input value=${newSupplierName} onInput=${(e) => setNewSupplierName(e.target.value)}
+            onKeyDown=${(e) => e.key === "Enter" && addSupplier()}
+            placeholder="Nieuwe leverancier"
+            class="flex-1 min-w-0 px-2.5 py-1.5 text-sm rounded-md border border-[#DCD8CB] bg-white focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]" />
+          <button onClick=${addSupplier} aria-label="Leverancier toevoegen"
+            class="px-2.5 py-1.5 rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F]">
+            <${Icon} d=${ICONS.plus} />
+          </button>
+        </div>
+      </div>
+
+    </div>`;
+
+  const regelsTab = html`
+    <div>
+      <div class="mb-5">
+        <label class="block text-xs text-[#5c5848] mb-1" for="regels-select">Leverancier</label>
+        ${suppliers.length === 0
+          ? html`<p class="text-sm text-[#8a8676]">Voeg eerst een leverancier toe bij <button class="underline text-[#1F3A5F]" onClick=${() => setTab("leveranciers")}>Leveranciers</button>.</p>`
+          : html`<select id="regels-select" value=${selectedId || ""} onChange=${(e) => setSelectedId(e.target.value)}
+              class="w-full sm:w-72 px-2.5 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]">
+              ${suppliers.map((s) => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
+            </select>`}
+      </div>
+      ${supplier && html`
+        <h2 class="font-display text-lg mb-1">Boekingsregels van ${supplier.name}
+          <span class="text-sm font-normal text-[#8a8676]" style="font-family:Inter,sans-serif">(${supplier.rules.length})</span></h2>
+        <p class="text-xs text-[#5c5848] mb-3">Als de omschrijving van een factuurregel het trefwoord bevat, gaat het bedrag naar dit grootboek. Wijzigingen worden direct opgeslagen.</p>
+        <div class="bg-white border border-[#E4E1D6] rounded-md overflow-x-auto mb-5">
+          ${supplier.rules.length === 0 && html`<p class="text-sm text-[#8a8676] italic p-3">Nog geen regels voor ${supplier.name}.</p>`}
+          ${supplier.rules.length > 0 && html`
+            <div class="hidden sm:grid grid-cols-[1fr_90px_1fr_70px_28px] gap-2 px-3 py-2 text-xs text-[#5c5848] bg-[#F4F2E9] border-b border-[#E4E1D6] min-w-[560px]">
+              <span>Trefwoord</span><span>Grootboek</span><span>Omschrijving</span><span>BTW</span><span></span>
+            </div>`}
+          ${supplier.rules.map((r) => html`
+            <div key=${r.id} class="grid grid-cols-2 sm:grid-cols-[1fr_90px_1fr_70px_28px] gap-2 px-3 py-2 items-center border-b border-[#EFEBDF] last:border-0 sm:min-w-[560px]">
+              <input class=${inputCls + " col-span-2 sm:col-span-1 text-sm"} value=${r.keyword} aria-label="Trefwoord"
+                onChange=${(e) => e.target.value.trim() && updateRule(r.id, { keyword: e.target.value.trim() })} />
+              <input class=${inputCls + " text-sm font-mono-num"} value=${r.grootboek} aria-label="Grootboek"
+                onChange=${(e) => e.target.value.trim() && updateRule(r.id, { grootboek: e.target.value.trim() })} />
+              <input class=${inputCls + " text-sm"} value=${r.grootboekNaam || ""} aria-label="Omschrijving"
+                onChange=${(e) => updateRule(r.id, { grootboekNaam: e.target.value.trim() })} />
+              <input class=${inputCls + " text-sm font-mono-num"} value=${r.btwCode || ""} aria-label="BTW-code"
+                onChange=${(e) => updateRule(r.id, { btwCode: e.target.value.trim() })} />
+              <button onClick=${() => deleteRule(r.id)} title="Regel verwijderen" class="text-[#8a8676] hover:text-[#B34D4D] justify-self-end">
+                <${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" />
+              </button>
+            </div>`)}
+        </div>
+        <div class="bg-white border border-[#E4E1D6] rounded-md p-3 max-w-2xl">
+          <h3 class="text-sm font-semibold mb-2">Nieuwe boekingsregel</h3>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <label class="col-span-2 sm:col-span-4 text-xs text-[#5c5848]">Trefwoord
+              <input class=${inputCls + " w-full mt-0.5 text-sm"} placeholder="bv. verpakking"
+                value=${newRule.keyword} onInput=${(e) => setNewRule({ ...newRule, keyword: e.target.value })} /></label>
+            <label class="text-xs text-[#5c5848]">Grootboek nr.
+              <input class=${inputCls + " w-full mt-0.5 text-sm font-mono-num"}
+                value=${newRule.grootboek} onInput=${(e) => setNewRule({ ...newRule, grootboek: e.target.value })} /></label>
+            <label class="col-span-2 text-xs text-[#5c5848]">Omschrijving (optioneel)
+              <input class=${inputCls + " w-full mt-0.5 text-sm"}
+                value=${newRule.grootboekNaam} onInput=${(e) => setNewRule({ ...newRule, grootboekNaam: e.target.value })} /></label>
+            <label class="text-xs text-[#5c5848]">BTW-code
+              <input class=${inputCls + " w-full mt-0.5 text-sm font-mono-num"}
+                value=${newRule.btwCode} onInput=${(e) => setNewRule({ ...newRule, btwCode: e.target.value })} /></label>
+          </div>
+          <button onClick=${addRule} class="mt-3 px-3 py-1.5 text-sm rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] flex items-center gap-1">
+            <${Icon} d=${ICONS.plus} cls="w-3.5 h-3.5" /> Regel toevoegen
+          </button>
+        </div>`}
+    </div>`;
+
+  /* ----- tab 3: instellingen ----- */
+  const instellingenTab = html`
+    <div class="max-w-xl space-y-8">
+      <div>
+        <h2 class="font-display text-lg mb-1">Back-up en overzetten</h2>
+        <p class="text-sm text-[#5c5848] mb-3">
+          Je leveranciers en boekingsregels staan in deze browser. Sla ze op als bestand om een back-up te hebben,
+          of om ze op een ander apparaat of in een andere browser te gebruiken.
+        </p>
+        <div class="flex gap-2">
+          <button onClick=${exportSettings} disabled=${suppliers.length === 0}
+            class="px-3 py-2 text-sm rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#1F3A5F] hover:text-[#F2EFE6] disabled:opacity-40 disabled:cursor-not-allowed">
+            Instellingen opslaan
+          </button>
+          <label class="px-3 py-2 text-sm rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF] cursor-pointer">
+            Instellingen laden
+            <input type="file" accept="application/json" class="hidden" onChange=${importSettings} />
+          </label>
+        </div>
+        ${importError && html`<p class="text-xs text-[#B34D4D] mt-2">${importError}</p>`}
+        <p class="text-xs text-[#8a8676] mt-2">Laden vervangt de leveranciers en regels die nu in deze browser staan.</p>
+      </div>
+
+      <div>
+        <h2 class="font-display text-lg mb-1">Huidige opslag</h2>
+        <div class="bg-white border border-[#E4E1D6] rounded-md px-3 py-2 text-sm">
+          <span class="font-mono-num">${suppliers.length}</span> ${suppliers.length === 1 ? "leverancier" : "leveranciers"} en
+          <span class="font-mono-num">${ruleCount}</span> ${ruleCount === 1 ? "boekingsregel" : "boekingsregels"}
+        </div>
+        <p class="text-xs text-[#8a8676] mt-2">
+          Facturen en resultaten worden nooit bewaard, alleen leveranciers en boekingsregels.
+          Wis je de browsergegevens, dan zijn ze weg. Bewaar daarom af en toe een back-up.
+        </p>
+      </div>
+    </div>`;
+
+  return html`
+    <div class="min-h-screen">
+      <header class="border-b border-[#DCD8CB] bg-[#1F3A5F] text-[#F2EFE6] px-6 py-5">
+        <div class="max-w-5xl mx-auto flex items-baseline justify-between">
+          <div>
+            <h1 class="font-display text-2xl tracking-tight">Grootboek Sorteerder</h1>
+            <p class="text-sm text-[#C9D2DE] mt-0.5">Groepeer factuurregels automatisch per grootboeknummer</p>
+          </div>
+          <div class="text-xs text-[#C9D2DE] font-mono-num h-4">
+            ${saveState === "saved" && "opgeslagen ✓"}
+            ${saveState === "error" && "niet opgeslagen — maak een back-up via Instellingen"}
+          </div>
+        </div>
+      </header>
+
+      <nav class="border-b border-[#DCD8CB] bg-white">
+        <div class="max-w-5xl mx-auto px-6 flex gap-1" role="tablist">
+          ${TABS.map(([key, label]) => html`
+            <button key=${key} role="tab" aria-selected=${tab === key} onClick=${() => setTab(key)}
+              class=${`px-4 py-3 text-sm border-b-2 -mb-px transition-colors ${
+                tab === key
+                  ? "border-[#1F3A5F] text-[#1F3A5F] font-semibold"
+                  : "border-transparent text-[#5c5848] hover:text-[#1B2430] hover:bg-[#F4F2E9]"
+              }`}>
+              ${label}
+            </button>`)}
+        </div>
+      </nav>
+
+      <main class="max-w-5xl mx-auto px-6 py-8">
+        ${tab === "sorteren" && sorteerTab}
+        ${tab === "leveranciers" && leveranciersTab}
+        ${tab === "regels" && regelsTab}
+        ${tab === "instellingen" && instellingenTab}
+      </main>
+    </div>`;
+}
+
+render(html`<${App} />`, document.getElementById("app"));
+</script>
+</body>
+</html>
