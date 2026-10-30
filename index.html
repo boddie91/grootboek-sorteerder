@@ -31,19 +31,37 @@ const fmtEUR = (n) => n.toLocaleString("nl-NL", { style: "currency", currency: "
 function loadSuppliers() {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    return v ? JSON.parse(v) : [];
+    const arr = v ? JSON.parse(v) : [];
+    // Bidfood: L = BTW 3, H = BTW 4 als startwaarde (aanpasbaar bij Boekingsregels)
+    return arr.map((s) => (s.btwMap ? s : { ...s, btwMap: /bidfood/i.test(s.name || "") ? { L: "3", H: "4" } : {} }));
   } catch (e) {
     return [];
   }
 }
 
-// Last euro-style amount on a line: 1.234,56 / 123,45 / 123.45, minus sign before OR after
+const parseNL = (str) => {
+  if (!str) return null;
+  const n = parseFloat(String(str).replace(/[.\s€]/g, "").replace(",", "."));
+  return Number.isNaN(n) ? null : n;
+};
+
+// Last euro-style amount on a line: 1.234,56 / 123,45 / 123.45, minus sign before OR after.
+// Dates (30.10.2026) and article numbers (92.22.94) are not amounts.
 function extractAmount(line) {
-  const matches = [...line.matchAll(/-?\d{1,3}(?:[.\s]\d{3})*,\d{2}-?|-?\d+\.\d{2}-?/g)];
+  const all = [...line.matchAll(/-?\d{1,3}(?:[.\s]\d{3})*,\d{2}-?|-?\d+\.\d{2}-?/g)];
+  const matches = all.filter((m) => {
+    const after = line.slice(m.index + m[0].length);
+    const before = line.slice(0, m.index);
+    if (/^[.\/]\d/.test(after)) return false;
+    if (/\d[.\/]$/.test(before)) return false;
+    return true;
+  });
   if (matches.length === 0) return null;
   const last = matches[matches.length - 1];
   const rawMatch = last[0];
   const omschrijving = line.slice(0, last.index).trim();
+  const rest = line.slice(last.index + rawMatch.length).trim();
+  const btwLetter = /^[A-Za-z]$/.test(rest) ? rest.toUpperCase() : "";
   let raw = rawMatch;
   let negative = false;
   if (raw.startsWith("-")) { negative = true; raw = raw.slice(1); }
@@ -53,8 +71,34 @@ function extractAmount(line) {
   let bedrag = parseFloat(normalized);
   if (Number.isNaN(bedrag)) return null;
   if (negative) bedrag = -Math.abs(bedrag);
-  return { omschrijving: omschrijving || rawMatch, bedrag };
+  return { omschrijving: omschrijving || rawMatch, bedrag, btwLetter };
 }
+
+// Eenheden / verpakkingen die tussen artikelnummer en omschrijving kunnen staan
+const UNIT_WORDS = /^(stuks?|stk|st\.?|kg|gr|g|ltr|liter|l|cl|ml|doos|dozen|x|krat|kratten|pak|pk|pallet|pal|colli|cs|ds|zk|zak|fl|bak|bk|tray|rol|emmer|set|kar)$/i;
+const isArticleToken = (t) => /^[\w.\-\/]*\d[\w.\-\/]*$/.test(t);
+
+// "92.22.94 1 ZK VERSZO TROSTOMATEN 750GR 4,25 ZK"  ->  "92.22.94 VERSZO TROSTOMATEN 750GR"
+// (artikelnummer + omschrijving; aantal, verpakking en prijzen vallen weg)
+function cleanDescription(text) {
+  const tokens = (text || "").trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "";
+  const out = [];
+  let i = 0;
+  if (tokens.length > 1 && isArticleToken(tokens[0])) {
+    out.push(tokens[0]);
+    i = 1;
+    while (i < tokens.length - 1 && (/^\d+([.,]\d+)?$/.test(tokens[i]) || UNIT_WORDS.test(tokens[i]))) i++;
+  }
+  for (; i < tokens.length; i++) {
+    if (/^-?\d+[.,]\d{2}-?$/.test(tokens[i])) break; // prijs
+    out.push(tokens[i]);
+  }
+  return out.join(" ").slice(0, 60);
+}
+
+// Samenvattingsregels van de factuur (geen artikelregels): standaard negeren
+const SUMMARY_RE = /(^|\s)(sub)?totaal|btw[\s-]*(bedrag|totaal|%|\d)|te betalen|verschuldigd|netto\s*(bedrag|totaal)?(\s|$)|bruto|factuurbedrag|saldo|vervaldatum|kredietlimiet|totaal\s*excl/i;
 
 function parseInvoiceText(text) {
   return text
@@ -63,54 +107,107 @@ function parseInvoiceText(text) {
     .filter(Boolean)
     .map((raw, i) => {
       const parsed = extractAmount(raw);
+      const base = parsed ? parsed.omschrijving : raw;
+      const tokens = base.split(/\s+/).filter(Boolean);
+      const hasArticle = tokens.length > 1 && isArticleToken(tokens[0]);
       return {
         id: `${i}-${uid()}`,
         raw,
-        omschrijving: parsed ? parsed.omschrijving : raw,
+        omschrijving: base,
+        clean: cleanDescription(base) || base,
         bedrag: parsed ? parsed.bedrag : null,
+        btwLetter: parsed ? parsed.btwLetter : "",
+        autoIgnored: !!parsed && !hasArticle && SUMMARY_RE.test(base),
       };
     });
 }
 
-function matchRule(omschrijving, rules) {
-  const lower = omschrijving.toLowerCase();
+const norm = (t) => (t || "").toLowerCase().replace(/\s+/g, " ").trim();
+
+// Zoekt een regel waarvan het trefwoord in de opgeschoonde OF originele omschrijving staat
+function matchRule(line, rules) {
+  const hay = [norm(line.clean), norm(line.omschrijving)];
   let best = null;
   for (const r of rules) {
     if (!r.keyword) continue;
-    if (lower.includes(r.keyword.toLowerCase())) {
-      if (!best || r.keyword.length > best.keyword.length) best = r;
+    const kw = norm(r.keyword);
+    if (hay.some((h) => h.includes(kw))) {
+      if (!best || kw.length > norm(best.keyword).length) best = r;
     }
   }
   return best;
 }
 
-// Stable keyword guess: leading article code + description, stop at bare numbers / unit words
-const UNIT_WORDS = /^(stuks?|st\.?|kg|gr|g|ltr|liter|l|doos|dozen|x|krat|kratten|pak|pk|pallet|colli|cs|ds)$/i;
 function guessStableKeyword(omschrijving) {
-  const tokens = (omschrijving || "").trim().split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return "";
-  const kept = [tokens[0]];
-  for (let i = 1; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (/^\d+([.,]\d+)?%?$/.test(t)) break;
-    if (UNIT_WORDS.test(t)) break;
-    kept.push(t);
-  }
-  return kept.join(" ").slice(0, 40);
+  return cleanDescription(omschrijving);
 }
 
-// Best-effort: always shown as editable
-function extractInvoiceMeta(text) {
-  const numMatch = text.match(/factuur\s*(?:nummer|nr)?[.:\s]*([A-Z0-9][A-Z0-9\-\/]{2,})/i);
-  const dateMatch = text.match(/(\d{1,2}[-\/]\d{1,2}[-\/]\d{2,4})/);
-  const totalMatch = text.match(
-    /(?:totaal|subtotaal)\s*(?:excl(?:usief)?\.?\s*(?:btw)?)?[\s:]*€?\s*(-?\d{1,3}(?:[.\s]\d{3})*,\d{2})/i
-  );
-  return {
-    factuurnummer: numMatch ? numMatch[1] : "",
-    factuurdatum: dateMatch ? dateMatch[1] : "",
-    totaalNetto: totalMatch ? totalMatch[1] : "",
+const DATE_RE = /\b(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})\b/;
+const AMT = "(-?\\d{1,3}(?:[.\\s]\\d{3})*,\\d{2}-?)";
+
+// Best-effort: altijd te corrigeren in de interface
+function extractInvoiceMeta(text, fileName) {
+  const lines = (text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const looksLikeNumber = (t) =>
+    /\d/.test(t) &&
+    /^[A-Za-z0-9][A-Za-z0-9\-\/.]{2,}$/.test(t) &&
+    !DATE_RE.test(t) &&
+    !/^\d{1,3}([.,]\d{3})*[.,]\d{2}$/.test(t);
+  const words = (str) => str.split(/[\s:;]+/).filter(Boolean);
+
+  // --- factuurnummer
+  let nr = "";
+  const labelRe = /(factuur\s*(?:nummer|nr\.?|no\.?|#)|invoice\s*(?:number|no\.?|nr\.?)|factuurnr\.?)\s*[:.]?\s*(.*)$/i;
+  for (let i = 0; i < lines.length && !nr; i++) {
+    const m = lines[i].match(labelRe);
+    if (!m) continue;
+    nr = words(m[2]).find(looksLikeNumber) || "";
+    if (!nr && lines[i + 1]) nr = words(lines[i + 1]).slice(0, 2).find(looksLikeNumber) || "";
+  }
+  if (!nr) {
+    for (const l of lines) {
+      const m = l.match(/^factuur\s*[:\-]?\s*(\S+)/i);
+      if (m && looksLikeNumber(m[1])) { nr = m[1]; break; }
+    }
+  }
+  if (!nr) {
+    const m = (text || "").match(/\b\d{2}-\d{5}\b/); // bv. Horesca 26-08637
+    if (m) nr = m[0];
+  }
+  if (!nr && fileName) {
+    nr = words(fileName.replace(/\.[a-z0-9]+$/i, "").replace(/[_]+/g, " ")).find(looksLikeNumber) || "";
+  }
+
+  // --- factuurdatum (niet de vervaldatum)
+  let date = "";
+  const dateAfter = (re) => {
+    for (const l of lines) {
+      const m = l.match(re);
+      if (m) return m[1];
+    }
+    return "";
   };
+  date =
+    dateAfter(/factuurdatum[^\d]{0,25}(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})/i) ||
+    dateAfter(/(?<![a-z])datum[^\d]{0,25}(\d{1,2}[-\/.]\d{1,2}[-\/.]\d{2,4})/i) ||
+    ((text || "").match(DATE_RE) || [])[1] ||
+    "";
+
+  // --- totaal netto (laatste voorkomen, onderaan de factuur)
+  const totalPatterns = [
+    new RegExp("(?:totaal|bedrag)\\s*(?:excl\\w*\\.?\\s*(?:btw)?|netto)[^\\d-]{0,15}" + AMT, "i"),
+    new RegExp("netto\\s*(?:totaal|bedrag|factuurbedrag)?[^\\d-]{0,15}" + AMT, "i"),
+    new RegExp("subtotaal[^\\d-]{0,15}" + AMT, "i"),
+  ];
+  let total = "";
+  for (const re of totalPatterns) {
+    for (const l of lines) {
+      const m = l.match(re);
+      if (m) total = m[1];
+    }
+    if (total) break;
+  }
+  return { factuurnummer: nr, factuurdatum: date, totaalNetto: total };
 }
 
 function downloadFile(filename, content, type) {
@@ -141,9 +238,12 @@ const inputCls = "px-2 py-1 text-xs rounded border border-[#DCD8CB] focus:outlin
 
 /* ---------- assign form (used for unmatched + ignored lines) ---------- */
 
-const AssignForm = ({ u, draft, setDraft, onAssign, supplierName, needsAmount }) => {
+const AssignForm = ({ u, draft, setDraft, onAssign, supplierName, needsAmount, knownNames, defaultBtw }) => {
   const d = draft || {};
-  const keywordValue = d.keyword !== undefined ? d.keyword : guessStableKeyword(u.omschrijving || u.raw || "");
+  const keywordValue = d.keyword !== undefined ? d.keyword : (u.clean || guessStableKeyword(u.omschrijving || u.raw || ""));
+  const naamValue = d.grootboekNaam !== undefined ? d.grootboekNaam : (knownNames && knownNames[(d.grootboek || "").trim()]) || "";
+  const btwValue = d.btwCode !== undefined ? d.btwCode : defaultBtw || "";
+  const remember = d.remember !== false;
   return html`
     <div class="flex items-center gap-1.5 mt-1.5 flex-wrap">
       ${!needsAmount && html`
@@ -152,15 +252,15 @@ const AssignForm = ({ u, draft, setDraft, onAssign, supplierName, needsAmount })
       ${needsAmount && html`
         <input class=${inputCls + " w-28 font-mono-num"} placeholder="Bedrag (bv. 12,50)"
           value=${d.bedrag || ""} onInput=${(e) => setDraft(u.id, { bedrag: e.target.value })} />`}
-      <input class=${inputCls + " w-24 font-mono-num"} placeholder="Grootboek nr."
+      <input class=${inputCls + " w-24 font-mono-num"} placeholder="Grootboek nr." list="gb-list"
         value=${d.grootboek || ""} onInput=${(e) => setDraft(u.id, { grootboek: e.target.value })} />
       <input class=${inputCls + " w-32"} placeholder="Naam (optioneel)"
-        value=${d.grootboekNaam || ""} onInput=${(e) => setDraft(u.id, { grootboekNaam: e.target.value })} />
+        value=${naamValue} onInput=${(e) => setDraft(u.id, { grootboekNaam: e.target.value })} />
       <input class=${inputCls + " w-14 font-mono-num"} placeholder="BTW"
-        value=${d.btwCode || ""} onInput=${(e) => setDraft(u.id, { btwCode: e.target.value })} />
+        value=${btwValue} onInput=${(e) => setDraft(u.id, { btwCode: e.target.value })} />
       ${!needsAmount && html`
         <label class="flex items-center gap-1 text-xs text-[#5c5848]">
-          <input type="checkbox" checked=${!!d.remember} onChange=${(e) => setDraft(u.id, { remember: e.target.checked })} />
+          <input type="checkbox" checked=${remember} onChange=${(e) => setDraft(u.id, { remember: e.target.checked })} />
           onthoud voor ${supplierName}
         </label>`}
       <button onClick=${() => onAssign(u.id)}
@@ -193,9 +293,12 @@ function App() {
   const [excludedFromMatch, setExcludedFromMatch] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [tab, setTab] = useState("sorteren");
+  const [fileName, setFileName] = useState("");
   const [mailAtts, setMailAtts] = useState([]);
   const [mailInfo, setMailInfo] = useState("");
   const [attLoading, setAttLoading] = useState("");
+  const [newBtwLetter, setNewBtwLetter] = useState("");
+  const [newBtwCode, setNewBtwCode] = useState("");
 
   /* pdf.js */
   useEffect(() => {
@@ -282,7 +385,9 @@ function App() {
     try {
       const text = await extractPdfLines(file);
       setInvoiceText(text);
+      setFileName(file.name || "");
       setPdfStatus("idle");
+      runParse(text, file.name || "");
     } catch (err) {
       setPdfStatus("error");
       setPdfError("Kon deze PDF niet uitlezen — mogelijk een scan zonder tekstlaag. Kopieer de regels dan handmatig.");
@@ -305,7 +410,7 @@ function App() {
   /* ---------- Outlook: bijlagen van geopende mail ---------- */
   useEffect(() => {
     if (!window.Office || !Office.onReady) return;
-    Office.onReady((info) => {
+    Office.onReady(() => {
       try {
         const item = Office.context && Office.context.mailbox && Office.context.mailbox.item;
         if (!item) return;
@@ -369,6 +474,9 @@ function App() {
     setNewRule({ keyword: "", grootboek: "", grootboekNaam: "", btwCode: "" });
   };
 
+  const setBtwMap = (map) =>
+    updateSuppliers(suppliers.map((sp) => (sp.id === supplier.id ? { ...sp, btwMap: map } : sp)));
+
   const updateRule = (ruleId, patch) => {
     updateSuppliers(
       suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: s.rules.map((r) => (r.id === ruleId ? { ...r, ...patch } : r)) } : s))
@@ -382,15 +490,27 @@ function App() {
   };
 
   /* ----- invoice flow ----- */
-  const handleParse = () => {
-    setLines(parseInvoiceText(invoiceText));
+  const runParse = (text, name) => {
+    setLines(parseInvoiceText(text));
     setAssignDraft({});
-    setInvoiceMeta(extractInvoiceMeta(invoiceText));
+    setInvoiceMeta(extractInvoiceMeta(text, name || ""));
     setExcludedFromMatch([]);
+    setCollapsedGroups({});
+    const low = (text || "").toLowerCase();
+    const found = suppliers.find((sp) => {
+      const full = (sp.name || "").toLowerCase();
+      const first = full.split(/\s+/)[0] || "";
+      return full && (low.includes(full) || (first.length >= 4 && low.includes(first)));
+    });
+    if (found) setSelectedId(found.id);
+    try { window.scrollTo(0, 0); } catch (e) {}
   };
+
+  const handleParse = () => runParse(invoiceText, fileName);
 
   const doReset = () => {
     setInvoiceText("");
+    setFileName("");
     setLines([]);
     setAssignDraft({});
     setPdfError("");
@@ -412,23 +532,20 @@ function App() {
     const draft = assignDraft[lineId];
     if (!draft || !draft.grootboek?.trim()) return;
     const line = lines.find((l) => l.id === lineId);
+    const gb = draft.grootboek.trim();
     let bedragOverride;
     if (line && line.bedrag === null) {
       if (!draft.bedrag?.trim()) return;
-      const parsedBedrag = parseFloat(draft.bedrag.replace(/\./g, "").replace(",", "."));
-      if (Number.isNaN(parsedBedrag)) return;
+      const parsedBedrag = parseNL(draft.bedrag);
+      if (parsedBedrag === null) return;
       bedragOverride = parsedBedrag;
     }
-    if (draft.remember && supplier) {
-      const keyword = draft.keyword?.trim() || guessStableKeyword(line?.omschrijving || "");
+    const naam = (draft.grootboekNaam !== undefined ? draft.grootboekNaam : knownNames[gb] || "").trim();
+    const explicitBtw = draft.btwCode !== undefined ? draft.btwCode.trim() : "";
+    if (draft.remember !== false && supplier && line && line.bedrag !== null) {
+      const keyword = draft.keyword?.trim() || line.clean || guessStableKeyword(line.omschrijving || "");
       if (keyword) {
-        const rule = {
-          id: uid(),
-          keyword,
-          grootboek: draft.grootboek.trim(),
-          grootboekNaam: draft.grootboekNaam?.trim() || "",
-          btwCode: draft.btwCode?.trim() || "",
-        };
+        const rule = { id: uid(), keyword, grootboek: gb, grootboekNaam: naam, btwCode: explicitBtw };
         updateSuppliers(suppliers.map((s) => (s.id === supplier.id ? { ...s, rules: [...s.rules, rule] } : s)));
       }
     }
@@ -437,14 +554,15 @@ function App() {
         l.id === lineId
           ? {
               ...l,
-              _forcedGrootboek: draft.grootboek.trim(),
-              _forcedNaam: draft.grootboekNaam?.trim() || "",
-              _forcedBtw: draft.btwCode?.trim() || "",
+              _forcedGrootboek: gb,
+              _forcedNaam: naam,
+              _forcedBtw: explicitBtw,
               ...(bedragOverride !== undefined ? { _forcedBedrag: bedragOverride } : {}),
             }
           : l
       )
     );
+    setExcludedFromMatch((prev) => prev.filter((id) => id !== lineId));
   };
 
   const unlinkLine = (lineId) => {
@@ -459,28 +577,45 @@ function App() {
   };
 
   /* ----- sort lines into groups / unmatched / ignored ----- */
+  const knownNames = {};
+  for (const sp of suppliers) for (const r of sp.rules) if (r.grootboekNaam) knownNames[r.grootboek] = r.grootboekNaam;
+  const defaultBtwFor = (line) => (supplier?.btwMap && line.btwLetter && supplier.btwMap[line.btwLetter]) || "";
+
   const groups = {};
   const unmatched = [];
   const ignoredLines = [];
-  const addToGroup = (key, naam, btw, item) => {
-    if (!groups[key]) groups[key] = { grootboek: key, grootboekNaam: naam, btwCode: btw, items: [], total: 0 };
+  const addToGroup = (grootboek, naam, btw, item) => {
+    const key = grootboek + "|" + btw;
+    if (!groups[key]) groups[key] = { key, grootboek, grootboekNaam: naam, btwCode: btw, items: [], total: 0 };
+    if (naam && !groups[key].grootboekNaam) groups[key].grootboekNaam = naam;
     groups[key].items.push(item);
     groups[key].total += item.bedrag;
   };
   for (const line of lines) {
     if (line._forcedGrootboek) {
       const amount = line._forcedBedrag !== undefined ? line._forcedBedrag : line.bedrag;
-      addToGroup(line._forcedGrootboek, line._forcedNaam, line._forcedBtw, { ...line, bedrag: amount });
+      addToGroup(
+        line._forcedGrootboek,
+        line._forcedNaam || knownNames[line._forcedGrootboek] || "",
+        line._forcedBtw || defaultBtwFor(line),
+        { ...line, bedrag: amount }
+      );
       continue;
     }
-    if (line.bedrag === null) { ignoredLines.push(line); continue; }
-    if (excludedFromMatch.includes(line.id)) { unmatched.push(line); continue; }
-    const rule = matchRule(line.omschrijving, rules);
-    if (rule) addToGroup(rule.grootboek, rule.grootboekNaam, rule.btwCode || "", line);
+    const excluded = excludedFromMatch.includes(line.id);
+    if (line.bedrag === null || (line.autoIgnored && !excluded)) { ignoredLines.push(line); continue; }
+    if (excluded) { unmatched.push(line); continue; }
+    const rule = matchRule(line, rules);
+    if (rule) addToGroup(rule.grootboek, rule.grootboekNaam || knownNames[rule.grootboek] || "", defaultBtwFor(line) || rule.btwCode || "", line);
     else unmatched.push(line);
   }
-  const finalGroups = Object.values(groups).sort((a, b) => a.grootboek.localeCompare(b.grootboek));
+  const finalGroups = Object.values(groups).sort((a, b) => a.grootboek.localeCompare(b.grootboek) || a.btwCode.localeCompare(b.btwCode));
   const finalTotal = finalGroups.reduce((s, g) => s + g.total, 0);
+  const recognizedCount = finalGroups.reduce((n, g) => n + g.items.length, 0);
+  const unmatchedSum = unmatched.reduce((s, l) => s + l.bedrag, 0);
+  const linesSum = finalTotal + unmatchedSum;
+  const metaTotal = parseNL(invoiceMeta.totaalNetto);
+  const sumDiff = metaTotal === null ? null : Math.round((linesSum - metaTotal) * 100) / 100;
 
   /* ----- export / import ----- */
   const exportSettings = () =>
@@ -527,22 +662,20 @@ function App() {
   const ruleCount = suppliers.reduce((n, s) => n + s.rules.length, 0);
 
   /* ----- tab 1: facturen sorteren ----- */
-  const sorteerTab = html`
-    <div>
-      <div class="mb-5">
-        <label class="block text-xs text-[#5c5848] mb-1" for="lev-select">Leverancier</label>
-        ${suppliers.length === 0
-          ? html`<p class="text-sm text-[#8a8676]">
-              Er zijn nog geen leveranciers.
-              <button class="underline text-[#1F3A5F]" onClick=${() => setTab("leveranciers")}>Voeg er eerst een toe</button>.
-            </p>`
-          : html`<select id="lev-select" value=${selectedId || ""}
-              onChange=${(e) => setSelectedId(e.target.value)}
-              class="w-full sm:w-72 px-2.5 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]">
-              ${suppliers.map((s) => html`<option key=${s.id} value=${s.id}>${s.name}</option>`)}
-            </select>`}
-      </div>
+  const supplierPicker = html`
+    <div class="mb-4 flex flex-wrap items-center gap-2">
+      <label class="text-xs text-[#5c5848]" for="lev-select">Leverancier</label>
+      ${suppliers.length === 0
+        ? html`<span class="text-sm text-[#8a8676]">Nog geen leveranciers.
+            <button class="underline text-[#1F3A5F]" onClick=${() => setTab("leveranciers")}>Voeg er eerst een toe</button>.</span>`
+        : html`<select id="lev-select" value=${selectedId || ""} onChange=${(e) => setSelectedId(e.target.value)}
+            class="w-full sm:w-72 px-2.5 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]">
+            ${suppliers.map((sp) => html`<option key=${sp.id} value=${sp.id}>${sp.name}</option>`)}
+          </select>`}
+    </div>`;
 
+  const inputArea = html`
+    <div>
       ${mailAtts.length > 0 && html`
         <div class="mb-4 p-3 rounded-md border border-[#C9D2DE] bg-[#EEF2F7]">
           <p class="text-xs text-[#1F3A5F] font-semibold mb-2">PDF-bijlagen in deze mail</p>
@@ -552,38 +685,44 @@ function App() {
               ${attLoading === a.id ? "Ophalen…" : a.name}
             </button>`)}
         </div>`}
-
       <label
         onDragOver=${(e) => { e.preventDefault(); setDragging(true); }}
         onDragLeave=${() => setDragging(false)}
         onDrop=${onDrop}
-        class=${`block mb-3 px-4 py-6 text-center text-sm rounded-md border-2 border-dashed cursor-pointer transition-colors ${
+        class=${`block mb-3 px-4 py-10 text-center text-sm rounded-md border-2 border-dashed cursor-pointer transition-colors ${
           dragging ? "border-[#1F3A5F] bg-[#E8EDF4] text-[#1F3A5F]" : "border-[#C9C5B6] bg-white text-[#5c5848] hover:bg-[#F4F2E9]"
         }`}>
         Sleep hier een PDF-factuur naartoe, of <span class="underline text-[#1F3A5F]">klik om te kiezen</span>
+        <div class="text-xs text-[#8a8676] mt-1">De factuur wordt meteen gesorteerd.</div>
         <input type="file" accept="application/pdf" class="hidden" onChange=${onPdfInput} />
       </label>
       ${pdfStatus === "loading-lib" && html`<p class="text-xs text-[#5c5848] mb-2">PDF-lezer laden…</p>`}
-      ${pdfStatus === "reading" && html`<p class="text-xs text-[#5c5848] mb-2">Tekst uitlezen…</p>`}
+      ${pdfStatus === "reading" && html`<p class="text-xs text-[#5c5848] mb-2">Factuur uitlezen…</p>`}
       ${pdfError && html`<p class="text-xs text-[#B34D4D] mb-2">${pdfError}</p>`}
 
-      <p class="text-xs text-[#5c5848] mb-2">Of plak de regels zelf hieronder (één regel per product, bedrag aan het eind).</p>
-      <textarea rows="6" value=${invoiceText} onInput=${(e) => setInvoiceText(e.target.value)}
-        placeholder=${"Verpakkingsmateriaal doos M    24,50\nTransportkosten NL             12,00\nEtiketten rol 500 stuks        8,95"}
-        class="w-full px-3 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white font-mono-num focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]"></textarea>
-
-      <div class="flex items-center gap-2">
-        <button onClick=${handleParse} disabled=${!supplier}
+      <details class="mt-4">
+        <summary class="text-xs text-[#5c5848] cursor-pointer">Of plak de factuurregels zelf</summary>
+        <textarea rows="6" value=${invoiceText} onInput=${(e) => setInvoiceText(e.target.value)}
+          placeholder=${"92.22.94 1 ZK VERSZO TROSTOMATEN 750GR 4,25 ZK 4,25 L"}
+          class="mt-2 w-full px-3 py-2 text-sm rounded-md border border-[#DCD8CB] bg-white font-mono-num focus:outline-none focus:ring-2 focus:ring-[#1F3A5F]"></textarea>
+        <button onClick=${handleParse} disabled=${!invoiceText.trim()}
           class="mt-2 px-4 py-2 text-sm rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] disabled:opacity-40 disabled:cursor-not-allowed">
           Sorteer naar grootboek
         </button>
+      </details>
+    </div>`;
+
+  const resultsArea = html`
+    <div class="space-y-5">
+      <div class="flex items-center justify-between gap-2">
+        <div class="text-sm text-[#5c5848] truncate">${fileName || "Geplakte factuurregels"}</div>
         <button onClick=${requestReset}
-          class="mt-2 px-4 py-2 text-sm rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF]">
+          class="shrink-0 px-3 py-1.5 text-sm rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF]">
           Nieuwe factuur
         </button>
       </div>
       ${confirmingReset && html`
-        <div class="mt-2 p-3 rounded-md border border-[#E9C9C9] bg-[#FBF2F2] text-sm">
+        <div class="p-3 rounded-md border border-[#E9C9C9] bg-[#FBF2F2] text-sm">
           <p class="text-[#7a2e2e] mb-2">Weet je zeker dat je een nieuwe factuur wilt beginnen? De huidige regels en resultaten worden verwijderd.</p>
           <div class="flex gap-2">
             <button onClick=${doReset} class="px-3 py-1.5 text-xs rounded-md bg-[#B34D4D] text-white hover:bg-[#9c3f3f]">Ja, verwijderen</button>
@@ -591,100 +730,123 @@ function App() {
           </div>
         </div>`}
 
-      ${lines.length > 0 && html`
-        <div class="mt-6 space-y-6">
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white border border-[#E4E1D6] rounded-md p-3">
+        ${[["factuurnummer", "Factuurnummer"], ["factuurdatum", "Factuurdatum"], ["totaalNetto", "Totaal netto"]].map(([key, label]) => html`
+          <label key=${key} class="text-xs text-[#5c5848]">
+            ${label}
+            <input class=${inputCls + " w-full mt-0.5 text-sm font-mono-num"} value=${invoiceMeta[key]}
+              onInput=${(e) => setInvoiceMeta({ ...invoiceMeta, [key]: e.target.value })} />
+          </label>`)}
+      </div>
 
-          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 bg-white border border-[#E4E1D6] rounded-md p-3">
-            ${[["factuurnummer", "Factuurnummer"], ["factuurdatum", "Factuurdatum"], ["totaalNetto", "Totaal netto"]].map(([key, label]) => html`
-              <label key=${key} class="text-xs text-[#5c5848]">
-                ${label}
-                <input class=${inputCls + " w-full mt-0.5 text-sm font-mono-num"} value=${invoiceMeta[key]}
-                  onInput=${(e) => setInvoiceMeta({ ...invoiceMeta, [key]: e.target.value })} />
-              </label>`)}
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm bg-white border border-[#E4E1D6] rounded-md px-3 py-2">
+        <span><b>${recognizedCount}</b> herkend</span>
+        <span class=${unmatched.length ? "text-[#B34D4D] font-semibold" : "text-[#5c5848]"}><b>${unmatched.length}</b> niet herkend</span>
+        <span class="text-[#8a8676]">${ignoredLines.length} genegeerd</span>
+        <span class="ml-auto font-mono-num">regels samen ${fmtEUR(linesSum)}</span>
+        ${sumDiff !== null && html`
+          <span class=${`w-full text-xs ${Math.abs(sumDiff) < 0.01 ? "text-[#3D6B5C]" : "text-[#9a6a1f]"}`}>
+            ${Math.abs(sumDiff) < 0.01
+              ? "✓ Klopt met het factuurtotaal"
+              : `Verschil met factuurtotaal (${invoiceMeta.totaalNetto}): ${fmtEUR(sumDiff)}${unmatched.length ? " — wijs eerst de niet-herkende regels toe" : ""}`}
+          </span>`}
+      </div>
+
+      ${unmatched.length > 0 && html`
+        <div>
+          <div class="flex items-center gap-1.5 text-sm font-semibold text-[#B34D4D] mb-1">
+            <${Icon} d=${ICONS.alert} /> Niet herkend (${unmatched.length})
           </div>
-
-          ${finalGroups.map((g) => {
-            const isCollapsed = collapsedGroups[g.grootboek] !== false;
-            return html`
-              <div key=${g.grootboek}>
-                <button onClick=${() => setCollapsedGroups((prev) => ({ ...prev, [g.grootboek]: prev[g.grootboek] === false }))}
-                  class="w-full flex items-center justify-between mb-1">
-                  <div class="flex items-baseline gap-2">
-                    <span class="font-mono-num text-sm font-semibold text-[#1F3A5F]">${g.grootboek}</span>
-                    ${g.grootboekNaam && html`<span class="text-sm text-[#5c5848]">${g.grootboekNaam}</span>`}
-                    <span class="text-xs text-[#8a8676]">(${g.items.length})</span>
-                  </div>
-                  <span class=${`text-[#5c5848] transition-transform ${isCollapsed ? "" : "rotate-180"}`}><${Icon} d=${ICONS.chevron} /></span>
-                </button>
-                <div class="bg-white border border-[#E4E1D6] rounded-md overflow-hidden">
-                  ${!isCollapsed && g.items.map((it) => html`
-                    <div key=${it.id} class="ledger-row flex justify-between items-center px-3 py-1.5 text-sm">
-                      <span>${it.omschrijving}</span>
-                      <div class="flex items-center gap-2">
-                        <span class="font-mono-num">${fmtEUR(it.bedrag)}</span>
-                        <button onClick=${() => unlinkLine(it.id)}
-                          title="Loskoppelen — terugzetten naar 'niet herkend' om opnieuw toe te wijzen"
-                          class="text-[#8a8676] hover:text-[#B34D4D]">
-                          <${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>`)}
-                  <div class="ledger-total flex justify-between px-3 py-1.5 text-sm font-semibold bg-[#F4F2E9]">
-                    <span>Subtotaal ${g.grootboek}</span>
-                    <span class="font-mono-num text-[#3D6B5C]">${fmtEUR(g.total)}</span>
-                  </div>
+          <div class="bg-white border border-[#E9C9C9] rounded-md divide-y divide-[#F1E4E4]">
+            ${unmatched.map((u) => html`
+              <div key=${u.id} class="px-3 py-2 text-sm">
+                <div class="flex justify-between items-center gap-2">
+                  <span>${u.clean}${u.btwLetter && html` <span class="text-xs text-[#8a8676]">(${u.btwLetter})</span>`}</span>
+                  <span class="font-mono-num text-[#5c5848] shrink-0">${fmtEUR(u.bedrag)}</span>
                 </div>
-              </div>`;
-          })}
+                <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
+                  onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${false}
+                  knownNames=${knownNames} defaultBtw=${defaultBtwFor(u)} />
+              </div>`)}
+          </div>
+        </div>`}
 
-          ${finalGroups.length > 0 && html`
-            <div>
-              <div class="flex justify-between px-3 py-2 text-base font-display font-semibold border-t-2 border-[#1B2430]">
-                <span>Totaal</span>
-                <span class="font-mono-num">${fmtEUR(finalTotal)}</span>
+      ${finalGroups.map((g) => {
+        const isCollapsed = collapsedGroups[g.key] !== false;
+        return html`
+          <div key=${g.key}>
+            <button onClick=${() => setCollapsedGroups((prev) => ({ ...prev, [g.key]: prev[g.key] === false }))}
+              class="w-full flex items-center justify-between mb-1">
+              <div class="flex items-baseline gap-2 flex-wrap text-left">
+                <span class="font-mono-num text-sm font-semibold text-[#1F3A5F]">${g.grootboek}</span>
+                ${g.grootboekNaam && html`<span class="text-sm text-[#5c5848]">${g.grootboekNaam}</span>`}
+                ${g.btwCode && html`<span class="text-xs px-1.5 py-0.5 rounded bg-[#E4E1D6] text-[#5c5848]">BTW ${g.btwCode}</span>`}
+                <span class="text-xs text-[#8a8676]">(${g.items.length})</span>
               </div>
-              <button onClick=${exportCSV}
-                class="px-3 py-1.5 text-xs rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#1F3A5F] hover:text-[#F2EFE6]">
-                Exporteer subtotalen als CSV
-              </button>
-            </div>`}
+              <span class=${`text-[#5c5848] transition-transform ${isCollapsed ? "" : "rotate-180"}`}><${Icon} d=${ICONS.chevron} /></span>
+            </button>
+            <div class="bg-white border border-[#E4E1D6] rounded-md overflow-hidden">
+              ${!isCollapsed && g.items.map((it) => html`
+                <div key=${it.id} class="ledger-row flex justify-between items-center px-3 py-1.5 text-sm gap-2">
+                  <span>${it.clean || it.omschrijving}</span>
+                  <div class="flex items-center gap-2 shrink-0">
+                    <span class="font-mono-num">${fmtEUR(it.bedrag)}</span>
+                    <button onClick=${() => unlinkLine(it.id)}
+                      title="Loskoppelen — terugzetten naar 'niet herkend' om opnieuw toe te wijzen"
+                      class="text-[#8a8676] hover:text-[#B34D4D]">
+                      <${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>`)}
+              <div class="ledger-total flex justify-between px-3 py-1.5 text-sm font-semibold bg-[#F4F2E9]">
+                <span>Subtotaal ${g.grootboek}${g.btwCode ? " · BTW " + g.btwCode : ""}</span>
+                <span class="font-mono-num text-[#3D6B5C]">${fmtEUR(g.total)}</span>
+              </div>
+            </div>
+          </div>`;
+      })}
 
-          ${unmatched.length > 0 && html`
-            <div>
-              <div class="flex items-center gap-1.5 text-sm font-semibold text-[#B34D4D] mb-1">
-                <${Icon} d=${ICONS.alert} /> Niet herkend (${unmatched.length})
-              </div>
-              <div class="bg-white border border-[#E9C9C9] rounded-md divide-y divide-[#F1E4E4]">
-                ${unmatched.map((u) => html`
-                  <div key=${u.id} class="px-3 py-2 text-sm">
-                    <div class="flex justify-between items-center">
-                      <span>${u.omschrijving || u.raw}</span>
-                      <span class="font-mono-num text-[#5c5848]">${fmtEUR(u.bedrag)}</span>
-                    </div>
-                    <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
-                      onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${false} />
-                  </div>`)}
-              </div>
-            </div>`}
+      ${finalGroups.length > 0 && html`
+        <div>
+          <div class="flex justify-between px-3 py-2 text-base font-display font-semibold border-t-2 border-[#1B2430]">
+            <span>Totaal</span>
+            <span class="font-mono-num">${fmtEUR(finalTotal)}</span>
+          </div>
+          <button onClick=${exportCSV}
+            class="px-3 py-1.5 text-xs rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#1F3A5F] hover:text-[#F2EFE6]">
+            Exporteer subtotalen als CSV
+          </button>
+        </div>`}
 
-          ${ignoredLines.length > 0 && html`
-            <div>
-              <button onClick=${() => setIgnoredExpanded((v) => !v)} class="w-full flex items-center justify-between mb-1">
-                <span class="text-sm font-semibold text-[#5c5848]">Standaard genegeerde regels (${ignoredLines.length})</span>
-                <span class=${`text-[#5c5848] transition-transform ${ignoredExpanded ? "rotate-180" : ""}`}><${Icon} d=${ICONS.chevron} /></span>
-              </button>
-              ${ignoredExpanded && html`
-                <p class="text-xs text-[#5c5848] mb-1">Regels zonder bedrag (adres, tekst e.d.) tellen niet mee. Hoort er toch eentje bij? Geef een bedrag en grootboek op.</p>
-                <div class="bg-white border border-[#E4E1D6] rounded-md divide-y divide-[#EFEBDF]">
-                  ${ignoredLines.map((u) => html`
-                    <div key=${u.id} class="px-3 py-2 text-sm">
-                      <div class="text-[#5c5848]">${u.raw}</div>
-                      <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
-                        onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${true} />
-                    </div>`)}
-                </div>`}
+      ${ignoredLines.length > 0 && html`
+        <div>
+          <button onClick=${() => setIgnoredExpanded((v) => !v)} class="w-full flex items-center justify-between mb-1">
+            <span class="text-sm font-semibold text-[#5c5848]">Standaard genegeerde regels (${ignoredLines.length})</span>
+            <span class=${`text-[#5c5848] transition-transform ${ignoredExpanded ? "rotate-180" : ""}`}><${Icon} d=${ICONS.chevron} /></span>
+          </button>
+          ${ignoredExpanded && html`
+            <p class="text-xs text-[#5c5848] mb-1">Adresregels, totalen en andere regels zonder artikel tellen niet mee. Hoort er toch eentje bij? Geef een grootboek op.</p>
+            <div class="bg-white border border-[#E4E1D6] rounded-md divide-y divide-[#EFEBDF]">
+              ${ignoredLines.map((u) => html`
+                <div key=${u.id} class="px-3 py-2 text-sm">
+                  <div class="flex justify-between gap-2 text-[#5c5848]">
+                    <span>${u.raw}</span>
+                  </div>
+                  <${AssignForm} u=${u} draft=${assignDraft[u.id]} setDraft=${setDraft}
+                    onAssign=${confirmAssign} supplierName=${supplier?.name} needsAmount=${u.bedrag === null}
+                    knownNames=${knownNames} defaultBtw=${defaultBtwFor(u)} />
+                </div>`)}
             </div>`}
         </div>`}
+    </div>`;
+
+  const sorteerTab = html`
+    <div>
+      ${supplierPicker}
+      ${lines.length === 0 ? inputArea : resultsArea}
+      <datalist id="gb-list">
+        ${Object.entries(knownNames).map(([nr, naam]) => html`<option key=${nr} value=${nr}>${naam}</option>`)}
+      </datalist>
     </div>`;
 
   /* ----- tab 2: leveranciers ----- */
@@ -738,6 +900,33 @@ function App() {
         <h2 class="font-display text-lg mb-1">Boekingsregels van ${supplier.name}
           <span class="text-sm font-normal text-[#8a8676]" style="font-family:Inter,sans-serif">(${supplier.rules.length})</span></h2>
         <p class="text-xs text-[#5c5848] mb-3">Als de omschrijving van een factuurregel het trefwoord bevat, gaat het bedrag naar dit grootboek. Wijzigingen worden direct opgeslagen.</p>
+        <div class="bg-white border border-[#E4E1D6] rounded-md p-3 mb-5 max-w-2xl">
+          <h3 class="text-sm font-semibold mb-1">BTW-letters op de factuur</h3>
+          <p class="text-xs text-[#5c5848] mb-2">Staat er achter een factuurregel een letter (bv. L of H)? Koppel die hier aan een BTW-code. De tool vult de code dan zelf in.</p>
+          <div class="flex flex-wrap gap-2 items-center">
+            ${Object.entries(supplier.btwMap || {}).map(([letter, code]) => html`
+              <div key=${letter} class="flex items-center gap-1 text-sm">
+                <span class="font-mono-num font-semibold w-5 text-center">${letter}</span>
+                <span class="text-[#8a8676]">=</span>
+                <input class=${inputCls + " w-14 font-mono-num"} value=${code} aria-label=${"BTW-code voor " + letter}
+                  onChange=${(e) => setBtwMap({ ...(supplier.btwMap || {}), [letter]: e.target.value.trim() })} />
+                <button onClick=${() => { const m = { ...(supplier.btwMap || {}) }; delete m[letter]; setBtwMap(m); }}
+                  title="Verwijderen" class="text-[#8a8676] hover:text-[#B34D4D]"><${Icon} d=${ICONS.trash} cls="w-3.5 h-3.5" /></button>
+              </div>`)}
+            <div class="flex items-center gap-1">
+              <input class=${inputCls + " w-10 font-mono-num uppercase"} maxlength="1" placeholder="L" value=${newBtwLetter}
+                onInput=${(e) => setNewBtwLetter(e.target.value.toUpperCase())} />
+              <input class=${inputCls + " w-14 font-mono-num"} placeholder="code" value=${newBtwCode}
+                onInput=${(e) => setNewBtwCode(e.target.value)} />
+              <button onClick=${() => {
+                  if (!newBtwLetter.trim() || !newBtwCode.trim()) return;
+                  setBtwMap({ ...(supplier.btwMap || {}), [newBtwLetter.trim()]: newBtwCode.trim() });
+                  setNewBtwLetter(""); setNewBtwCode("");
+                }}
+                class="px-2 py-1 text-xs rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F]">Toevoegen</button>
+            </div>
+          </div>
+        </div>
         <div class="bg-white border border-[#E4E1D6] rounded-md overflow-x-auto mb-5">
           ${supplier.rules.length === 0 && html`<p class="text-sm text-[#8a8676] italic p-3">Nog geen regels voor ${supplier.name}.</p>`}
           ${supplier.rules.length > 0 && html`
