@@ -20,7 +20,7 @@
 <div id="app"></div>
 
 <script type="module">
-import { html, render, useState, useEffect } from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
+import { html, render, useState, useEffect, useRef } from "https://cdn.jsdelivr.net/npm/htm@3.1.1/preact/standalone.module.js";
 
 /* ---------- helpers ---------- */
 
@@ -408,20 +408,41 @@ function App() {
 
 
   /* ---------- Outlook: bijlagen van geopende mail ---------- */
+  const latest = useRef({});
+
+  const readCurrentItem = () => {
+    try {
+      const item = Office.context && Office.context.mailbox && Office.context.mailbox.item;
+      if (!item) { setMailAtts([]); return []; }
+      const atts = (item.attachments || []).filter(
+        (a) => a.attachmentType === "file" && (/pdf/i.test(a.contentType || "") || /\.pdf$/i.test(a.name || ""))
+      );
+      setMailAtts(atts);
+      const from = ((item.from && (item.from.displayName + " " + item.from.emailAddress)) || "") + " " + (item.subject || "");
+      setMailInfo(from.trim());
+      const sp = latest.current.suppliers || [];
+      const match = sp.find((s) => s.name && from.toLowerCase().includes(s.name.toLowerCase()));
+      if (match) setSelectedId(match.id);
+      return atts;
+    } catch (e) {
+      return [];
+    }
+  };
+
+  // Nieuwe mail geselecteerd (zijpaneel vastgepind): begin schoon en lees de nieuwe bijlage meteen in
+  const onItemChanged = () => {
+    latest.current.resetQuiet && latest.current.resetQuiet();
+    const atts = readCurrentItem();
+    if (atts.length === 1) latest.current.loadAttachment(atts[0]);
+  };
+
   useEffect(() => {
     if (!window.Office || !Office.onReady) return;
     Office.onReady(() => {
+      const atts = readCurrentItem();
+      if (atts.length === 1) latest.current.loadAttachment(atts[0]);
       try {
-        const item = Office.context && Office.context.mailbox && Office.context.mailbox.item;
-        if (!item) return;
-        const atts = (item.attachments || []).filter(
-          (a) => a.attachmentType === "file" && (/pdf/i.test(a.contentType || "") || /\.pdf$/i.test(a.name || ""))
-        );
-        setMailAtts(atts);
-        const from = ((item.from && (item.from.displayName + " " + item.from.emailAddress)) || "") + " " + (item.subject || "");
-        setMailInfo(from.trim());
-        const match = suppliers.find((s) => s.name && from.toLowerCase().includes(s.name.toLowerCase()));
-        if (match) setSelectedId(match.id);
+        Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, () => latest.current.onItemChanged());
       } catch (e) {}
     });
   }, []);
@@ -439,7 +460,7 @@ function App() {
       const bin = atob(res.value.content);
       const bytes = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      await handlePdfFile(new File([bytes], att.name || "factuur.pdf", { type: "application/pdf" }));
+      await latest.current.handlePdfFile(new File([bytes], att.name || "factuur.pdf", { type: "application/pdf" }));
     });
   };
 
@@ -650,6 +671,12 @@ function App() {
     }
     const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(";")).join("\n");
     downloadFile(`grootboek-export-${supplier?.name || "export"}.csv`, csv, "text/csv;charset=utf-8;");
+  };
+
+  latest.current = {
+    suppliers, handlePdfFile, loadAttachment, onItemChanged,
+    resetQuiet: () => { setInvoiceText(""); setFileName(""); setLines([]); setAssignDraft({}); setPdfError(""); setPdfStatus("idle");
+      setInvoiceMeta({ factuurnummer: "", factuurdatum: "", totaalNetto: "" }); setConfirmingReset(false); setExcludedFromMatch([]); },
   };
 
   /* ---------- render ---------- */
