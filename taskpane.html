@@ -210,6 +210,66 @@ function extractInvoiceMeta(text, fileName) {
   return { factuurnummer: nr, factuurdatum: date, totaalNetto: total };
 }
 
+const SB_URL = "https://kimiiwxzjcmgzpgdxkjd.supabase.co";
+const SB_KEY = "sb_publishable_Gi71IgzNYHUjHmECEcgRBw_VcnGlJgU"; // publiek bedoeld; data is beveiligd met inlog + RLS
+const SB_SESSION_KEY = "grootboek-sorteerder-sb-sessie";
+const sbLoadSession = () => {
+  try { return JSON.parse(localStorage.getItem(SB_SESSION_KEY) || "null"); } catch (e) { return null; }
+};
+const sbSaveSession = (s) => {
+  try { if (s) localStorage.setItem(SB_SESSION_KEY, JSON.stringify(s)); else localStorage.removeItem(SB_SESSION_KEY); } catch (e) {}
+};
+const sbToSession = (j) => ({
+  access_token: j.access_token,
+  refresh_token: j.refresh_token,
+  expires_at: Math.floor(Date.now() / 1000) + (j.expires_in || 3600),
+  email: (j.user && j.user.email) || "",
+  user_id: (j.user && j.user.id) || "",
+});
+async function sbAuth(grant, body) {
+  const r = await fetch(`${SB_URL}/auth/v1/token?grant_type=${grant}`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const m = j.error_description || j.msg || j.message || "";
+    throw new Error(/invalid login/i.test(m) ? "E-mailadres of wachtwoord klopt niet." : m || "Inloggen mislukt.");
+  }
+  return sbToSession(j);
+}
+async function sbFreshSession(sess) {
+  if (!sess) return null;
+  if (sess.expires_at - 60 > Date.now() / 1000) return sess;
+  const n = await sbAuth("refresh_token", { refresh_token: sess.refresh_token });
+  n.email = n.email || sess.email;
+  n.user_id = n.user_id || sess.user_id;
+  sbSaveSession(n);
+  return n;
+}
+async function sbFetchRemote(sess) {
+  const r = await fetch(`${SB_URL}/rest/v1/grootboek_instellingen?select=data,updated_at`, {
+    headers: { apikey: SB_KEY, Authorization: `Bearer ${sess.access_token}` },
+  });
+  if (!r.ok) throw new Error("Ophalen mislukt (" + r.status + ")");
+  const rows = await r.json();
+  return rows[0] || null;
+}
+async function sbPush(sess, suppliers) {
+  const r = await fetch(`${SB_URL}/rest/v1/grootboek_instellingen?on_conflict=user_id`, {
+    method: "POST",
+    headers: {
+      apikey: SB_KEY,
+      Authorization: `Bearer ${sess.access_token}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({ user_id: sess.user_id, data: { suppliers }, updated_at: new Date().toISOString() }),
+  });
+  if (!r.ok) throw new Error("Opslaan mislukt (" + r.status + ")");
+}
+
 function downloadFile(filename, content, type) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -293,6 +353,14 @@ function App() {
   const [excludedFromMatch, setExcludedFromMatch] = useState([]);
   const [dragging, setDragging] = useState(false);
   const [tab, setTab] = useState("sorteren");
+  const [sbSession, setSbSession] = useState(sbLoadSession);
+  const [sbStatus, setSbStatus] = useState("");
+  const [sbMsg, setSbMsg] = useState("");
+  const [sbLast, setSbLast] = useState(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const sbRef = useRef({});
+  const pushTimer = useRef(null);
   const [fileName, setFileName] = useState("");
   const [mailAtts, setMailAtts] = useState([]);
   const [mailInfo, setMailInfo] = useState("");
@@ -327,7 +395,76 @@ function App() {
   const updateSuppliers = (next) => {
     setSuppliers(next);
     persist(next);
+    schedulePush(next);
   };
+
+  /* ---------- Supabase: online opslag ---------- */
+  const syncDown = async (sessIn) => {
+    setSbStatus("bezig");
+    setSbMsg("");
+    try {
+      const sess = await sbFreshSession(sessIn);
+      setSbSession(sess);
+      const row = await sbFetchRemote(sess);
+      const remote = row && row.data && Array.isArray(row.data.suppliers) ? row.data.suppliers : null;
+      if (remote && remote.length > 0) {
+        setSuppliers(remote);
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(remote)); } catch (e) {}
+        setSelectedId((cur) => (remote.some((x) => x.id === cur) ? cur : remote[0].id));
+      } else if ((sbRef.current.suppliers || []).length > 0) {
+        await sbPush(sess, sbRef.current.suppliers);
+      }
+      setSbStatus("ok");
+      setSbLast(new Date());
+    } catch (e) {
+      setSbStatus("fout");
+      setSbMsg(e.message || "Synchroniseren mislukt.");
+    }
+  };
+
+  const schedulePush = (next) => {
+    if (!sbRef.current.session) return;
+    clearTimeout(pushTimer.current);
+    pushTimer.current = setTimeout(async () => {
+      try {
+        const sess = await sbFreshSession(sbRef.current.session);
+        setSbSession(sess);
+        await sbPush(sess, next);
+        setSbStatus("ok");
+        setSbMsg("");
+        setSbLast(new Date());
+      } catch (e) {
+        setSbStatus("fout");
+        setSbMsg(e.message || "Opslaan mislukt.");
+      }
+    }, 600);
+  };
+
+  const sbLogin = async () => {
+    setSbStatus("bezig");
+    setSbMsg("");
+    try {
+      const sess = await sbAuth("password", { email: loginEmail.trim(), password: loginPassword });
+      sbSaveSession(sess);
+      setLoginPassword("");
+      await syncDown(sess);
+    } catch (e) {
+      setSbStatus("fout");
+      setSbMsg(e.message || "Inloggen mislukt.");
+    }
+  };
+
+  const sbLogout = () => {
+    sbSaveSession(null);
+    setSbSession(null);
+    setSbStatus("");
+    setSbMsg("");
+  };
+
+  useEffect(() => {
+    if (sbSession) syncDown(sbSession);
+  }, []);
+
 
   const supplier = suppliers.find((s) => s.id === selectedId) || null;
   const rules = supplier?.rules || [];
@@ -679,6 +816,8 @@ function App() {
       setInvoiceMeta({ factuurnummer: "", factuurdatum: "", totaalNetto: "" }); setConfirmingReset(false); setExcludedFromMatch([]); },
   };
 
+  sbRef.current = { session: sbSession, suppliers };
+
   /* ---------- render ---------- */
   const TABS = [
     ["sorteren", "Facturen sorteren"],
@@ -1018,6 +1157,45 @@ function App() {
         </div>
         ${importError && html`<p class="text-xs text-[#B34D4D] mt-2">${importError}</p>`}
         <p class="text-xs text-[#8a8676] mt-2">Laden vervangt de leveranciers en regels die nu in deze browser staan.</p>
+      </div>
+
+      <div>
+        <h2 class="font-display text-lg mb-1">Online opslag</h2>
+        <p class="text-sm text-[#5c5848] mb-3">
+          Bewaart je leveranciers en boekingsregels online, zodat ze op elk apparaat en in Outlook gelijk blijven.
+        </p>
+        ${sbSession
+          ? html`
+            <div class="bg-white border border-[#E4E1D6] rounded-md px-3 py-2 text-sm space-y-2">
+              <div>Ingelogd als <b>${sbSession.email}</b></div>
+              <div class=${sbStatus === "fout" ? "text-[#B34D4D]" : "text-[#3D6B5C]"}>
+                ${sbStatus === "bezig" && "Synchroniseren…"}
+                ${sbStatus === "ok" && "✓ Gesynchroniseerd" + (sbLast ? " om " + sbLast.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit" }) : "")}
+                ${sbStatus === "fout" && (sbMsg || "Er ging iets mis.")}
+              </div>
+              <div class="flex gap-2">
+                <button onClick=${() => syncDown(sbSession)}
+                  class="px-3 py-1.5 text-xs rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#1F3A5F] hover:text-[#F2EFE6]">Nu synchroniseren</button>
+                <button onClick=${sbLogout}
+                  class="px-3 py-1.5 text-xs rounded-md border border-[#DCD8CB] text-[#5c5848] hover:bg-[#EFEBDF]">Uitloggen</button>
+              </div>
+            </div>`
+          : html`
+            <div class="bg-white border border-[#E4E1D6] rounded-md p-3 space-y-2">
+              <input type="email" autocomplete="username" placeholder="E-mailadres" value=${loginEmail}
+                onInput=${(e) => setLoginEmail(e.target.value)}
+                class=${inputCls + " w-full text-sm"} />
+              <input type="password" autocomplete="current-password" placeholder="Wachtwoord" value=${loginPassword}
+                onInput=${(e) => setLoginPassword(e.target.value)}
+                onKeyDown=${(e) => e.key === "Enter" && sbLogin()}
+                class=${inputCls + " w-full text-sm"} />
+              <button onClick=${sbLogin} disabled=${!loginEmail.trim() || !loginPassword || sbStatus === "bezig"}
+                class="px-3 py-1.5 text-sm rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] disabled:opacity-40 disabled:cursor-not-allowed">
+                ${sbStatus === "bezig" ? "Bezig…" : "Inloggen en synchroniseren"}
+              </button>
+              ${sbStatus === "fout" && html`<p class="text-xs text-[#B34D4D]">${sbMsg}</p>`}
+              <p class="text-xs text-[#8a8676]">Je moet maar één keer per apparaat of browser inloggen. Je huidige regels worden bij de eerste keer overgenomen.</p>
+            </div>`}
       </div>
 
       <div>
