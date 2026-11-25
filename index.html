@@ -270,6 +270,42 @@ async function sbPush(sess, suppliers) {
   if (!r.ok) throw new Error("Opslaan mislukt (" + r.status + ")");
 }
 
+// Wijzigingen die nog niet online staan: bij het synchroniseren worden die samengevoegd in plaats van overschreven.
+const DIRTY_KEY = "grootboek-sorteerder-niet-online";
+const BACKUP_KEY = "grootboek-sorteerder-reservekopie";
+const markDirty = (on) => { try { if (on) localStorage.setItem(DIRTY_KEY, "1"); else localStorage.removeItem(DIRTY_KEY); } catch (e) {} };
+const isDirty = () => { try { return localStorage.getItem(DIRTY_KEY) === "1"; } catch (e) { return false; } };
+const backupLocal = (suppliers) => {
+  try { if (suppliers && suppliers.length) localStorage.setItem(BACKUP_KEY, JSON.stringify({ datum: new Date().toISOString(), suppliers })); } catch (e) {}
+};
+// Samenvoegen: niets gaat verloren. Leveranciers op id of naam, regels op id of trefwoord.
+function mergeSuppliers(remote, local) {
+  const norm = (x) => String(x || "").trim().toLowerCase();
+  const out = (remote || []).map((s) => ({ ...s, rules: [...(s.rules || [])], btwMap: { ...(s.btwMap || {}) } }));
+  for (const ls of local || []) {
+    const t = out.find((s) => s.id === ls.id || (norm(s.name) && norm(s.name) === norm(ls.name)));
+    if (!t) { out.push(ls); continue; }
+    for (const r of ls.rules || []) {
+      if (!t.rules.some((x) => x.id === r.id || (norm(x.keyword) && norm(x.keyword) === norm(r.keyword)))) t.rules.push(r);
+    }
+    t.btwMap = { ...(ls.btwMap || {}), ...t.btwMap };
+  }
+  return out;
+}
+async function sbSignup(email, password) {
+  const r = await fetch(`${SB_URL}/auth/v1/signup`, {
+    method: "POST",
+    headers: { apikey: SB_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const m = j.error_description || j.msg || j.message || "";
+    throw new Error(/already registered|already exists/i.test(m) ? "Er bestaat al een account met dit e-mailadres. Log in." : /password/i.test(m) ? "Kies een wachtwoord van minstens 6 tekens." : m || "Account aanmaken mislukt.");
+  }
+  return j.access_token ? sbToSession(j) : null;
+}
+
 function downloadFile(filename, content, type) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -395,6 +431,7 @@ function App() {
   const updateSuppliers = (next) => {
     setSuppliers(next);
     persist(next);
+    markDirty(true);
     schedulePush(next);
   };
 
@@ -407,13 +444,19 @@ function App() {
       setSbSession(sess);
       const row = await sbFetchRemote(sess);
       const remote = row && row.data && Array.isArray(row.data.suppliers) ? row.data.suppliers : null;
+      const local = sbRef.current.suppliers || [];
       if (remote && remote.length > 0) {
-        setSuppliers(remote);
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(remote)); } catch (e) {}
-        setSelectedId((cur) => (remote.some((x) => x.id === cur) ? cur : remote[0].id));
-      } else if ((sbRef.current.suppliers || []).length > 0) {
-        await sbPush(sess, sbRef.current.suppliers);
+        // Nog niet opgeslagen wijzigingen op dit apparaat? Dan samenvoegen, anders geldt de online versie.
+        const next = isDirty() && local.length ? mergeSuppliers(remote, local) : remote;
+        backupLocal(local);
+        setSuppliers(next);
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch (e) {}
+        setSelectedId((cur) => (next.some((x) => x.id === cur) ? cur : next[0].id));
+        if (JSON.stringify(next) !== JSON.stringify(remote)) await sbPush(sess, next);
+      } else if (local.length > 0) {
+        await sbPush(sess, local);
       }
+      markDirty(false);
       setSbStatus("ok");
       setSbLast(new Date());
     } catch (e) {
@@ -430,6 +473,7 @@ function App() {
         const sess = await sbFreshSession(sbRef.current.session);
         setSbSession(sess);
         await sbPush(sess, next);
+        markDirty(false);
         setSbStatus("ok");
         setSbMsg("");
         setSbLast(new Date());
@@ -447,10 +491,33 @@ function App() {
       const sess = await sbAuth("password", { email: loginEmail.trim(), password: loginPassword });
       sbSaveSession(sess);
       setLoginPassword("");
+      // Eerste keer inloggen op deze plek: regels van hier altijd samenvoegen met de online versie.
+      if ((sbRef.current.suppliers || []).length) markDirty(true);
       await syncDown(sess);
     } catch (e) {
       setSbStatus("fout");
       setSbMsg(e.message || "Inloggen mislukt.");
+    }
+  };
+
+  const sbRegister = async () => {
+    setSbStatus("bezig");
+    setSbMsg("");
+    try {
+      const sess = await sbSignup(loginEmail.trim(), loginPassword);
+      if (!sess) {
+        setSbStatus("fout");
+        setSbMsg("Account aangemaakt. Klik op de link in de bevestigingsmail en log daarna hier in.");
+        return;
+      }
+      sbSaveSession(sess);
+      setLoginPassword("");
+      // Eerste keer inloggen op deze plek: regels van hier altijd samenvoegen met de online versie.
+      if ((sbRef.current.suppliers || []).length) markDirty(true);
+      await syncDown(sess);
+    } catch (e) {
+      setSbStatus("fout");
+      setSbMsg(e.message || "Account aanmaken mislukt.");
     }
   };
 
@@ -1205,8 +1272,12 @@ function App() {
                 class="px-3 py-1.5 text-sm rounded-md bg-[#1F3A5F] text-[#F2EFE6] hover:bg-[#16293F] disabled:opacity-40 disabled:cursor-not-allowed">
                 ${sbStatus === "bezig" ? "Bezig…" : "Inloggen en synchroniseren"}
               </button>
+              <button onClick=${sbRegister} disabled=${!loginEmail.trim() || loginPassword.length < 6 || sbStatus === "bezig"}
+                class="ml-2 px-3 py-1.5 text-sm rounded-md border border-[#1F3A5F] text-[#1F3A5F] hover:bg-[#EFEBDF] disabled:opacity-40 disabled:cursor-not-allowed">
+                Nog geen account? Maak er een
+              </button>
               ${sbStatus === "fout" && html`<p class="text-xs text-[#B34D4D]">${sbMsg}</p>`}
-              <p class="text-xs text-[#8a8676]">Je moet maar één keer per apparaat of browser inloggen. Je huidige regels worden bij de eerste keer overgenomen.</p>
+              <p class="text-xs text-[#8a8676]">Log op elke plek (Outlook én het kantoor-dashboard) één keer in met hetzelfde account; daarna zijn je regels overal gelijk. Regels van verschillende plekken worden samengevoegd, er gaat niets verloren.</p>
             </div>`}
       </div>
 

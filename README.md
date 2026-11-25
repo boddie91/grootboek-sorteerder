@@ -52,8 +52,14 @@ Supabase gesynchroniseerd. Facturen en resultaten worden nooit bewaard. Handmati
 - Tabel `public.grootboek_instellingen (user_id uuid pk default auth.uid(), data jsonb, updated_at timestamptz)`, RLS aan,
   policy "eigen rij" (alleen eigen `user_id`). Inhoud: `{ "suppliers": [...] }`.
 - De publishable key staat in de HTML (bedoeld om openbaar te zijn; de data wordt beschermd door inloggen + RLS).
-- Gedrag: bij inloggen wint de online versie als die data bevat; is die leeg, dan wordt de lokale versie omhoog gezet.
-  Elke wijziging wordt na 600 ms geüpload. Inloggen via e-mail + wachtwoord (REST, geen Supabase-bibliotheek).
+- Gedrag: elke wijziging zet de vlag `grootboek-sorteerder-niet-online` en wordt na 600 ms geüpload (vlag weer weg).
+  Bij synchroniseren: staat de vlag aan (of is het de eerste keer inloggen op die plek), dan worden lokaal en online
+  **samengevoegd** (`mergeSuppliers`: leveranciers op id/naam, regels op id/trefwoord; niets gaat verloren);
+  anders geldt de online versie. Vóór elke vervanging komt de lokale stand in `grootboek-sorteerder-reservekopie`.
+  Gevolg: een regel die op plek A is verwijderd terwijl plek B nog niet-opgeslagen wijzigingen had, kan terugkomen.
+- Inloggen én account aanmaken via e-mail + wachtwoord (REST, geen Supabase-bibliotheek).
+  Tot 25-11-2026 bestond er geen account en was de tabel leeg: alle regels stonden alleen lokaal.
+- Het kantoor-dashboard maakt daarnaast een reservekopie van de regels in de Dropbox-map (zie die repo).
 
 ### Outlook-invoegtoepassing
 - Persoonlijk Outlook-account (hotmail/outlook.com) op het web: "Via URL" is uitgeschakeld, dus het manifest moet **Uit bestand** geladen worden.
