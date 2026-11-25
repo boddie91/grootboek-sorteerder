@@ -818,6 +818,18 @@ function App() {
 
   sbRef.current = { session: sbSession, suppliers };
 
+  // Voor het kantoor-dashboard: een pdf (base64) van buitenaf openen, bijv. een bijlage die in Outlook is gedownload.
+  window.grootboekLaadPdf = (b64, naam) => {
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      latest.current.resetQuiet && latest.current.resetQuiet();
+      latest.current.handlePdfFile(new File([bytes], naam || "factuur.pdf", { type: "application/pdf" }));
+      return true;
+    } catch (e) { return false; }
+  };
+
   /* ---------- render ---------- */
   const TABS = [
     ["sorteren", "Facturen sorteren"],

@@ -61,6 +61,12 @@ Supabase gesynchroniseerd. Facturen en resultaten worden nooit bewaard. Handmati
   heeft de mail precies één PDF-bijlage, dan wordt die automatisch ingelezen en gesorteerd.
 - Een oud manifest met een placeholder-url gaf eerder een GitHub-404 in het paneel: bij vreemd gedrag eerst het geladen manifest controleren.
 
+### Kantoor-dashboard
+In het dashboard (repo `hoekje-kantoor-dashboard`) draait de tool als gewone webpagina, zonder Office.js. Het dashboard roept
+`window.grootboekLaadPdf(base64, naam)` aan om een pdf te openen die de gebruiker in Outlook (binnen het dashboard) heeft gedownload.
+Let op: het dashboard heeft een eigen `localStorage` – leveranciers/regels zijn daar niet dezelfde als in de Outlook-invoegtoepassing,
+tenzij ze via online opslag gesynchroniseerd worden.
+
 ## Werken aan de tool (voor Claude)
 1. Haal eerst de nieuwste versie op (`git fetch`), want in een andere chat kan er iets veranderd zijn.
 2. Wijzig `taskpane.html` en kopieer naar `index.html`. Controleer de syntaxis van het script (`node --check` op de inhoud van het `<script type="module">`, met de CDN-import vervangen).
